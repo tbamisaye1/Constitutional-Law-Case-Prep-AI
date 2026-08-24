@@ -38,7 +38,7 @@ def retrieve_node(state: PrepState) -> dict:
         return {
             "evidence": [],
             "grounding_status": "no_evidence",
-            "grounding_notes": "No FAISS index yet, or empty question. Upload PDFs via /ingest/pdf.",
+            "grounding_notes": "No articles indexed yet, or empty question. Upload PDFs via /ingest/pdf.",
         }
 
     # similarity_search_with_score returns (Document, score). Lower distance
@@ -61,5 +61,5 @@ def retrieve_node(state: PrepState) -> dict:
 
     return {
         "evidence": evidence,
-        "grounding_notes": f"Retrieved {len(evidence)} chunks.",
+        "grounding_notes": f"Retrieved {len(evidence)} passages from uploaded articles.",
     }
