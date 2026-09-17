@@ -5,34 +5,46 @@ This is the first half of RAG. The second half (retriever tool on the agent)
 comes once you have a few Bronner precedents indexed.
 """
 
-import os
-import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.rag.ingest_pdf import ingest_pdf
-from app.rag.store import build_or_merge_store
+from app.rag.store import (
+    build_or_merge_store,
+    delete_uploaded_pdf,
+    list_index_sources,
+    remove_source_from_index,
+)
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 
-def _writable_data_dir() -> Path | None:
-    """Return a directory we can write PDFs and FAISS into, or None on read-only hosts."""
-    if os.environ.get("VERCEL"):
-        return None
-    settings = get_settings()
-    for candidate in (settings.data_dir, Path(tempfile.gettempdir()) / "case-law-agent-data"):
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            probe = candidate / ".write_probe"
-            probe.write_text("ok")
-            probe.unlink()
-            return candidate
-        except OSError:
-            continue
-    return None
+class RemoveSourceRequest(BaseModel):
+    source: str = Field(min_length=1)
+
+
+@router.get("/sources")
+def list_sources_route():
+    return {"sources": list_index_sources()}
+
+
+@router.delete("/source")
+def remove_source_route(body: RemoveSourceRequest):
+    removed = remove_source_from_index(body.source)
+    if removed == 0:
+        raise HTTPException(status_code=404, detail=f"No indexed chunks matched source '{body.source}'.")
+
+    if body.source.lower().endswith(".pdf"):
+        delete_uploaded_pdf(body.source)
+
+    return {
+        "source": body.source,
+        "chunks_removed": removed,
+        "message": "Removed from search index.",
+    }
 
 
 @router.post("/pdf")
@@ -47,15 +59,13 @@ async def ingest_pdf_route(file: UploadFile = File(...)):
             detail="OPENROUTER_API_KEY missing; embeddings need it.",
         )
 
-    if _writable_data_dir() is None:
+    try:
+        settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "PDF upload is not available on the hosted demo (read-only server). "
-                "Run locally: uvicorn app.main:app --port 8000 and npm run dev, "
-                "then open http://localhost:5173/upload."
-            ),
-        )
+            detail=f"Cannot prepare upload directory on this host ({e}).",
+        ) from e
 
     dest = settings.uploads_dir / Path(file.filename).name
     content = await file.read()
@@ -64,7 +74,7 @@ async def ingest_pdf_route(file: UploadFile = File(...)):
     except OSError as e:
         raise HTTPException(
             status_code=503,
-            detail=f"Cannot save upload on this host ({e}). Use local dev for PDF ingest.",
+            detail=f"Cannot save upload on this host ({e}).",
         ) from e
 
     chunks = ingest_pdf(dest, source_name=dest.name)
@@ -73,14 +83,14 @@ async def ingest_pdf_route(file: UploadFile = File(...)):
 
     try:
         build_or_merge_store(chunks)
-    except OSError as e:
+    except Exception as e:
         raise HTTPException(
-            status_code=503,
-            detail=f"Cannot update search index on this host ({e}). Use local dev for PDF ingest.",
+            status_code=500,
+            detail=f"Failed to update search index: {e}",
         ) from e
 
     return {
         "filename": dest.name,
         "chunks": len(chunks),
-        "message": "Indexed into FAISS. Agent retrieval tool comes next.",
+        "message": "Indexed into FAISS. Ask AI can search this case now.",
     }

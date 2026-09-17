@@ -9,3 +9,5 @@ data/uploads/
 # Local demo bootstrap (see demo/README.md)
 demo/supreme_court_cases.json
 .pytest_cache
+.vercel
+.env*
