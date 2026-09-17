@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = "openai/gpt-4o-mini"
     openrouter_embedding_model: str = "openai/text-embedding-3-small"
+    # Direct OpenAI Responses API for Ask AI Web mode. The existing
+    # OpenRouter key remains the fallback and still powers PDF embeddings.
+    openai_api_key: str = ""
+    openai_web_model: str = "gpt-5-mini"
     # openrouter (default) | local
     embeddings_backend: str = "openrouter"
     local_embedding_model: str = "BAAI/bge-small-en-v1.5"
@@ -56,6 +60,10 @@ class Settings(BaseSettings):
     @property
     def database_configured(self) -> bool:
         return bool(self.database_url.strip())
+
+    @property
+    def web_search_configured(self) -> bool:
+        return bool(self.openai_api_key.strip() or self.openrouter_api_key.strip())
 
     def model_post_init(self, __context) -> None:
         if os.environ.get("VERCEL"):

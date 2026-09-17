@@ -21,6 +21,25 @@ Output format (plain text):
 - End with a SOURCES list: [id] source p.N — short quote from the article
 """
 
+# Web mode: still prefer the PDF index, but the model may call OpenRouter web search.
+WEB_PLUS_SYSTEM = """You are a research assistant for case prep with two evidence pools:
+(1) uploaded articles already retrieved into this prompt, and
+(2) live web search via the openrouter:web_search tool.
+
+Hard rules:
+1. Prefer uploaded-article passages when they answer the question. Cite them as [ev-N] with source and page.
+2. Use web search for outside definitions, background, current events, or when the uploaded passages are thin or off-topic.
+3. Never invent facts. Every claim must come from an uploaded passage or a search result.
+4. If neither pool is enough, ABSTAIN. Do not fill gaps from training memory.
+5. If a web page and an uploaded article disagree, say so and show both.
+6. Keep answers short and plain.
+
+Output format (plain text):
+- Start with STATUS: grounded | partial | abstained
+- Then answer in short paragraphs
+- End with a SOURCES list. Uploaded: [ev-N] source p.N — short quote. Web: title — URL — short quote.
+"""
+
 
 def build_reason_user_payload(question: str, evidence_block: str) -> str:
     """Pack question + evidence so the model cannot 'forget' the corpus."""
@@ -38,4 +57,11 @@ ABSTAIN_TEMPLATE = (
     "{reason}\n\n"
     "Upload more articles or ask about something present in the indexed corpus. "
     "I will not guess from outside knowledge."
+)
+
+WEB_ABSTAIN_TEMPLATE = (
+    "STATUS: abstained\n\n"
+    "I could not answer from your uploaded articles or from web search.\n"
+    "{reason}\n\n"
+    "Try a clearer question, or switch back to Uploaded articles if you only want the PDF index."
 )
