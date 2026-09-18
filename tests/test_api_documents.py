@@ -9,6 +9,8 @@ other devices the file is gone.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests.conftest import requires_database
@@ -187,4 +189,76 @@ def test_upload_is_refused_when_blob_is_not_configured(client, workspace_id, mon
     )
 
     assert response.status_code == 503
+
+
+@requires_database
+def test_blob_client_upload_mints_a_workspace_scoped_token(client, workspace_id, monkeypatch):
+    monkeypatch.setenv(
+        "BLOB_READ_WRITE_TOKEN",
+        "vercel_blob_rw_store_testhost_secretsegment",
+    )
+
+    response = client.post(
+        "/documents/blob-client-upload",
+        headers={WORKSPACE_HEADER: workspace_id},
+        json={
+            "type": "blob.generate-client-token",
+            "payload": {
+                "pathname": "ignored/by/server.pdf",
+                "clientPayload": json.dumps(
+                    {"documentId": "pdf-big", "caseId": "youngstown", "name": "Youngstown.pdf"}
+                ),
+                "multipart": False,
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["type"] == "blob.generate-client-token"
+    assert body["clientToken"].startswith("vercel_blob_client_")
+    assert workspace_id in body["pathname"]
+    assert body["pathname"].startswith("case-law-agent/workspaces/")
+    assert body["pathname"].endswith(".pdf")
+
+
+@requires_database
+def test_complete_direct_upload_records_the_blob(client, workspace_id, blob_stub):
+    pathname = f"case-law-agent/workspaces/{workspace_id}/pdf-big/secret.pdf"
+    response = client.post(
+        "/documents/complete",
+        headers={WORKSPACE_HEADER: workspace_id},
+        json={
+            "document_id": "pdf-big",
+            "case_id": "youngstown",
+            "name": "Youngstown.pdf",
+            "size_bytes": 4_500_000,
+            "blob_pathname": pathname,
+            "blob_url": f"https://example.public.blob.vercel-storage.com/{pathname}",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == "pdf-big"
+    assert body["stored"] is True
+    assert body["size"] == 4_500_000
+
+
+@requires_database
+def test_complete_rejects_another_workspaces_pathname(client, workspace_id):
+    response = client.post(
+        "/documents/complete",
+        headers={WORKSPACE_HEADER: workspace_id},
+        json={
+            "document_id": "pdf-big",
+            "case_id": "youngstown",
+            "name": "Youngstown.pdf",
+            "size_bytes": 1000,
+            "blob_pathname": "case-law-agent/workspaces/other-id/pdf-big/secret.pdf",
+            "blob_url": "https://example.public.blob.vercel-storage.com/x.pdf",
+        },
+    )
+
+    assert response.status_code == 400
     assert "browser-only" in response.json()["detail"]

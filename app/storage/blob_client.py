@@ -80,6 +80,79 @@ def store_slug() -> str | None:
     return store_id.removeprefix("store_").lower()
 
 
+def read_write_token_required() -> str:
+    """
+    Static read-write token required to mint browser upload tokens.
+
+    OIDC is enough for server-side put/get/delete on Vercel, but client tokens
+    are HMAC-signed with the long-lived read-write token. Without it, direct
+    browser uploads cannot be authorized.
+    """
+    token = _read_write_token()
+    if not token:
+        raise RuntimeError(
+            "BLOB_READ_WRITE_TOKEN is required for direct browser uploads. "
+            "OIDC alone cannot mint client tokens."
+        )
+    return token
+
+
+def generate_client_token(
+    pathname: str,
+    *,
+    allowed_content_types: list[str] | None = None,
+    maximum_size_in_bytes: int | None = None,
+    add_random_suffix: bool = False,
+    allow_overwrite: bool = False,
+    valid_until_ms: int | None = None,
+    token_payload: str | None = None,
+) -> str:
+    """
+    Mint a short-lived vercel_blob_client_* token for a browser PUT.
+
+    Mirrors @vercel/blob's generateClientTokenFromReadWriteToken so the React
+    client can upload PDFs straight to Blob and skip Vercel's 4.5 MB request
+    body cap on our API functions.
+    """
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import time
+
+    read_write = read_write_token_required()
+    parts = read_write.split("_")
+    store_id = parts[3] if len(parts) >= 4 else ""
+    if not store_id:
+        raise RuntimeError("Invalid BLOB_READ_WRITE_TOKEN: missing store id segment")
+
+    payload_obj: dict = {
+        "pathname": pathname,
+        "addRandomSuffix": add_random_suffix,
+        "allowOverwrite": allow_overwrite,
+        "validUntil": valid_until_ms
+        if valid_until_ms is not None
+        else int(time.time() * 1000) + 60 * 60 * 1000,
+    }
+    if allowed_content_types is not None:
+        payload_obj["allowedContentTypes"] = allowed_content_types
+    if maximum_size_in_bytes is not None:
+        payload_obj["maximumSizeInBytes"] = maximum_size_in_bytes
+    if token_payload is not None:
+        payload_obj["tokenPayload"] = token_payload
+
+    payload_b64 = base64.b64encode(json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")).decode(
+        "ascii"
+    )
+    signature = hmac.new(
+        read_write.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    sealed = base64.b64encode(f"{signature}.{payload_b64}".encode("utf-8")).decode("ascii")
+    return f"vercel_blob_client_{store_id}_{sealed}"
+
+
 def put_blob(pathname: str, data: bytes, content_type: str) -> dict:
     """
     Write bytes at an exact pathname, replacing whatever was there.
