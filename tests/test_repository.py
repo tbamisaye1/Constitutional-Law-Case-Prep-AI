@@ -48,6 +48,40 @@ def test_push_then_pull_round_trips_an_annotation(cursor, workspace_id):
     assert annotations[0]["text"] == "pole camera"
     assert annotations[0]["page"] == 3
     assert annotations[0]["deleted"] is False
+    assert annotations[0]["fileId"] == "pdf-1"
+
+
+@requires_database
+def test_document_pull_includes_stored_after_blob_upload(cursor, workspace_id):
+    """
+    Readers only re-fetch PDF bytes when filesMeta.stored is true.
+
+    Sync must expose that flag even though blob_pathname itself stays off the
+    client wire (so one workspace cannot point at another's Blob object).
+    """
+    from app.db.repository import pull_changes, touch_workspace, upsert_document_blob
+
+    touch_workspace(cursor, workspace_id)
+    now = datetime.now(timezone.utc)
+    upsert_document_blob(
+        cursor,
+        workspace_id,
+        document_id="pdf-article-1",
+        case_id="corpus-articles",
+        name="Summary.pdf",
+        size_bytes=1200,
+        content_type="application/pdf",
+        blob_pathname=f"case-law-agent/workspaces/{workspace_id}/pdf-article-1/secret.pdf",
+        blob_url="https://example.public.blob.vercel-storage.com/secret.pdf",
+        now=now,
+    )
+
+    documents = pull_changes(cursor, workspace_id, 0)["documents"]
+
+    assert len(documents) == 1
+    assert documents[0]["id"] == "pdf-article-1"
+    assert documents[0]["stored"] is True
+    assert "blob_pathname" not in documents[0]
 
 
 @requires_database
@@ -93,6 +127,33 @@ def test_delete_comes_back_as_a_tombstone(cursor, workspace_id):
 
     assert len(annotations) == 1
     assert annotations[0]["deleted"] is True
+
+
+@requires_database
+def test_id_only_annotation_tombstone_inserts(cursor, workspace_id):
+    """
+    Client delete tombstones historically sent only {id, deleted, updatedAt}.
+
+    That used to 500 on NotNullViolation for case_id and block every later sync
+    retry in the browser. Defaults must let the INSERT succeed.
+    """
+    from app.db.repository import pull_changes
+
+    written = _push(
+        cursor,
+        workspace_id,
+        {
+            "annotations": [
+                {"id": "a-sparse-tombstone", "updatedAt": 1_000, "deleted": True},
+            ]
+        },
+    )
+
+    assert written["annotations"] == 1
+    annotations = pull_changes(cursor, workspace_id, 0)["annotations"]
+    assert annotations[0]["id"] == "a-sparse-tombstone"
+    assert annotations[0]["deleted"] is True
+    assert annotations[0]["caseId"] == ""
 
 
 @requires_database

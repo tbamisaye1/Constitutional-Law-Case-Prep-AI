@@ -75,6 +75,7 @@ ENTITIES: tuple[EntitySpec, ...] = (
             ("issue", "issue"),
             ("tag", "tag"),
             ("usefulness", "usefulness"),
+            ("headlineNote", "headline_note"),
             ("holding", "holding"),
             ("rule", "rule"),
             ("usePetitioner", "use_petitioner"),
@@ -107,6 +108,8 @@ ENTITIES: tuple[EntitySpec, ...] = (
             ("quote", "quote"),
             ("text", "body"),
             ("rects", "rects"),
+            ("pinned", "pinned"),
+            ("color", "color"),
         ),
         json_fields=frozenset({"rects"}),
     ),
@@ -126,6 +129,62 @@ ENTITIES: tuple[EntitySpec, ...] = (
 )
 
 ENTITY_BY_NAME = {spec.name: spec for spec in ENTITIES}
+
+# Client delete tombstones often only carry the primary key (id + deleted).
+# Postgres still needs every NOT NULL column on INSERT of a never-seen row, so
+# fill the gaps before we write. Empty strings are fine: the row is tombstoned
+# and the pull path already exposes deleted=True to other devices.
+_PUSH_DEFAULTS: dict[str, dict[str, Any]] = {
+    "matters": {"title": "", "season": "", "issues": []},
+    "cases": {
+        "name": "",
+        "cite": "",
+        "year": "",
+        "usefulness": "background",
+        "headlineNote": "",
+        "holding": "",
+        "rule": "",
+        "usePetitioner": "",
+        "useRespondent": "",
+        "suggestedFile": "",
+    },
+    "documents": {
+        "caseId": "",
+        "name": "",
+        "size": 0,
+        "contentType": "application/pdf",
+    },
+    "annotations": {
+        "caseId": "",
+        "page": 1,
+        "kind": "page",
+        "quote": "",
+        "text": "",
+        "pinned": False,
+        "color": "gold",
+    },
+    "notes": {"html": ""},
+    "library_records": {"data": {}},
+}
+
+
+def _with_push_defaults(spec: EntitySpec, row: dict[str, Any]) -> dict[str, Any]:
+    """
+    Replace missing or null required wire fields so an id-only tombstone inserts.
+
+    Live rows from a healthy client already send these fields. This exists for
+    the delete path in collectChanges(), which historically only sent `{id,
+    deleted: true, updatedAt}` for annotations and documents.
+    """
+    defaults = _PUSH_DEFAULTS.get(spec.name)
+    if not defaults:
+        return row
+
+    filled = dict(row)
+    for field_name, default in defaults.items():
+        if filled.get(field_name) is None:
+            filled[field_name] = default
+    return filled
 
 
 def to_epoch_ms(value: datetime) -> int:
@@ -153,6 +212,10 @@ def _row_to_wire(spec: EntitySpec, row: dict[str, Any]) -> dict[str, Any]:
         wire[field_name] = row[column]
     wire["updatedAt"] = to_epoch_ms(row["updated_at"])
     wire["deleted"] = row["deleted_at"] is not None
+    # Clients need this to know they can re-fetch PDF bytes from Blob after a
+    # refresh or on another device. blob_pathname itself stays server-only.
+    if spec.name == "documents" and "blob_pathname" in row:
+        wire["stored"] = row["blob_pathname"] is not None
     return wire
 
 
@@ -177,9 +240,12 @@ def pull_changes(cursor, workspace_id: str, since_ms: int) -> dict[str, list[dic
 
     for spec in ENTITIES:
         columns = ", ".join(column for _, column in spec.all_fields)
+        # documents.blob_pathname is not a sync field (clients must not aim a
+        # row at someone else's blob), but pull still needs it to set `stored`.
+        extra = ", blob_pathname" if spec.name == "documents" else ""
         cursor.execute(
             f"""
-            SELECT {columns}, updated_at, deleted_at
+            SELECT {columns}{extra}, updated_at, deleted_at
             FROM {spec.table}
             WHERE workspace_id = %s AND updated_at > %s
             ORDER BY updated_at
@@ -267,7 +333,10 @@ def push_changes(
 
         count = 0
         for row in rows[:MAX_ROWS_PER_ENTITY]:
-            cursor.execute(statement, _push_values(spec, workspace_id, row, now))
+            cursor.execute(
+                statement,
+                _push_values(spec, workspace_id, _with_push_defaults(spec, row), now),
+            )
             count += cursor.rowcount
         written[name] = count
 
