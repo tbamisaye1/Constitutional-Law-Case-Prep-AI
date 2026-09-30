@@ -49,6 +49,10 @@ def hydrate_faiss_index(faiss_dir: Path, bundled_dir: Path) -> bool:
     """
     Ensure faiss_dir has an index: try Blob download, else copy bundled build artifact.
     Returns True if an index is available.
+
+    Important on Vercel: if Blob is configured but the download errors, do not
+    silently fall back to the bundled demo index. A later persist would upload
+    that stale package and wipe production uploads (e.g. Milligan).
     """
     if (faiss_dir / "index.faiss").exists():
         return True
@@ -56,11 +60,14 @@ def hydrate_faiss_index(faiss_dir: Path, bundled_dir: Path) -> bool:
     if blob_configured():
         try:
             data = get_blob(BLOB_INDEX_PATH)
-            if data:
-                _unzip_to(data, faiss_dir)
-                return (faiss_dir / "index.faiss").exists()
-        except Exception:
-            pass
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not hydrate FAISS from Blob ({BLOB_INDEX_PATH}): {error}"
+            ) from error
+        if data:
+            _unzip_to(data, faiss_dir)
+            return (faiss_dir / "index.faiss").exists()
+        # Blob is empty (first deploy). Seed from the build artifact below.
 
     return copy_bundled_index(bundled_dir, faiss_dir)
 

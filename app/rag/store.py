@@ -159,8 +159,15 @@ def _clear_index(index_path: Path) -> None:
 
 
 def delete_uploaded_pdf(filename: str) -> None:
-    """Remove saved PDF bytes from the writable uploads folder, if present."""
+    """Remove saved PDF bytes from local uploads/ and the durable Blob mirror."""
     settings = get_settings()
     path = settings.uploads_dir / Path(filename).name
     if path.is_file():
         path.unlink()
+    try:
+        from app.storage.ingest_files import delete_uploaded_pdf_blob
+
+        delete_uploaded_pdf_blob(filename)
+    except Exception:
+        # Index removal already succeeded; Blob cleanup is best-effort.
+        pass

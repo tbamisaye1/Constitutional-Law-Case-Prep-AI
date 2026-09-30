@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
@@ -36,6 +36,7 @@ from app.storage.blob_client import (
     read_write_token_required,
     store_slug,
 )
+from app.storage.ingest_files import load_uploaded_pdf, persist_uploaded_pdf
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -65,10 +66,11 @@ def list_sources_route():
 @router.get("/file/{filename}")
 def get_uploaded_pdf_route(filename: str):
     """
-    Serve a PDF that was saved under uploads/ during /ingest/pdf.
+    Serve a PDF that was saved during ingest.
 
-    Ask AI cites these by filename. The Case library / Articles viewers use this
-    when the browser does not already hold the bytes in IndexedDB.
+    Prefer the local uploads/ copy (fast on a warm instance). On Vercel that
+    folder is under /tmp, so after a cold start we rehydrate from the durable
+    Blob mirror and cache it locally for the rest of the instance life.
     """
     safe_name = Path(filename).name
     if not safe_name or safe_name != filename.replace("\\", "/").split("/")[-1]:
@@ -78,20 +80,39 @@ def get_uploaded_pdf_route(filename: str):
 
     settings = get_settings()
     path = settings.uploads_dir / safe_name
-    if not path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No uploaded PDF named '{safe_name}'. "
-                "Re-upload via /ingest/pdf or attach it in Case library."
-            ),
+    if path.is_file():
+        return FileResponse(
+            path,
+            media_type="application/pdf",
+            filename=safe_name,
+            content_disposition_type="inline",
         )
 
-    return FileResponse(
-        path,
-        media_type="application/pdf",
-        filename=safe_name,
-        content_disposition_type="inline",
+    remote = load_uploaded_pdf(safe_name)
+    if remote:
+        try:
+            settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(remote)
+        except OSError:
+            # Still serve from memory if /tmp is full or read-only.
+            return Response(
+                content=remote,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'inline; filename="{safe_name}"'},
+            )
+        return FileResponse(
+            path,
+            media_type="application/pdf",
+            filename=safe_name,
+            content_disposition_type="inline",
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No uploaded PDF named '{safe_name}'. "
+            "Re-upload via /ingest/pdf or attach it in Case library."
+        ),
     )
 
 
@@ -259,7 +280,7 @@ def _is_allowed_blob_url(url: str, pathname: str) -> bool:
 
 
 def _index_pdf_bytes(content: bytes, filename: str) -> dict:
-    """Write bytes under uploads/, chunk, merge into FAISS."""
+    """Write bytes under uploads/, mirror to Blob, chunk, merge into FAISS."""
     settings = get_settings()
     try:
         settings.uploads_dir.mkdir(parents=True, exist_ok=True)
@@ -276,6 +297,14 @@ def _index_pdf_bytes(content: bytes, filename: str) -> dict:
         raise HTTPException(
             status_code=503,
             detail=f"Cannot save upload on this host ({e}).",
+        ) from e
+
+    try:
+        persist_uploaded_pdf(filename, content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Indexed PDF could not be persisted to Blob: {e}",
         ) from e
 
     chunks = ingest_pdf(dest, source_name=dest.name)

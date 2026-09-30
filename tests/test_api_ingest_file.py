@@ -38,11 +38,33 @@ def test_get_uploaded_pdf_404_when_missing(tmp_path, monkeypatch):
         uploads_dir = uploads
 
     monkeypatch.setattr("app.api.ingest.get_settings", lambda: FakeSettings())
+    monkeypatch.setattr("app.api.ingest.load_uploaded_pdf", lambda name: None)
 
     with TestClient(app) as client:
         response = client.get("/ingest/file/missing.pdf")
 
     assert response.status_code == 404
+
+
+def test_get_uploaded_pdf_rehydrates_from_blob(tmp_path, monkeypatch):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+
+    class FakeSettings:
+        uploads_dir = uploads
+
+    monkeypatch.setattr("app.api.ingest.get_settings", lambda: FakeSettings())
+    monkeypatch.setattr(
+        "app.api.ingest.load_uploaded_pdf",
+        lambda name: b"%PDF-1.7\nfrom blob" if name == "Milligan.pdf" else None,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/ingest/file/Milligan.pdf")
+
+    assert response.status_code == 200
+    assert response.content.startswith(b"%PDF")
+    assert (uploads / "Milligan.pdf").read_bytes().startswith(b"%PDF")
 
 
 def test_get_uploaded_pdf_rejects_path_traversal(tmp_path, monkeypatch):
@@ -53,6 +75,7 @@ def test_get_uploaded_pdf_rejects_path_traversal(tmp_path, monkeypatch):
         uploads_dir = uploads
 
     monkeypatch.setattr("app.api.ingest.get_settings", lambda: FakeSettings())
+    monkeypatch.setattr("app.api.ingest.load_uploaded_pdf", lambda name: None)
 
     with TestClient(app) as client:
         response = client.get("/ingest/file/../../etc/passwd")
