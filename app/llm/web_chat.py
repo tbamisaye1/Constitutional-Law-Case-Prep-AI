@@ -128,14 +128,16 @@ def extract_openai_response(data: dict[str, Any]) -> tuple[str, list[EvidenceHit
 def _build_user_content(question: str, corpus_evidence: list[EvidenceHit]) -> str:
     corpus_block = _format_corpus_block(corpus_evidence)
     return (
-        "UPLOADED ARTICLES (prefer these when they answer the question):\n"
+        "UPLOADED ARTICLES (prefer these when they match the selected passage / question):\n"
         f"{corpus_block}\n\n"
-        "QUESTION:\n"
+        "QUESTION (may include a SELECTED PASSAGE — if so, explain that passage):\n"
         f"{question}\n\n"
+        "If there is a SELECTED PASSAGE, ground the answer in that text and any matching "
+        "uploaded passages. Do not pivot to an unrelated case or doctrine from other chunks. "
         "If the uploaded passages are enough, answer from them and cite [ev-N]. "
-        "If you need outside definitions, background, news, or the corpus is thin, "
+        "If you need outside definitions or background on the named case/statute, "
         "use web search. Cite web sources with title + URL. "
-        "Do not invent facts that appear in neither the uploaded passages nor search results."
+        "Do not invent facts that appear in neither the selected passage, uploaded passages, nor search results."
     )
 
 

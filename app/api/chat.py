@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from app.agents.prep_graph import prep_graph
+from app.grounding.selection import build_chat_message
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -26,6 +27,10 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     matter_id: str = "bronner-2026"
     grounding_source: GroundingSourceIn = "documents"
+    # Highlighted PDF / guide text from the Ask AI bubble. Optional for older
+    # clients; when present it is packed into the graph message so retrieval
+    # and the model actually see what the user selected.
+    selection: str | None = None
 
 
 class EvidenceOut(BaseModel):
@@ -51,9 +56,18 @@ class ChatResponse(BaseModel):
 @router.post("", response_model=ChatResponse)
 def chat(body: ChatRequest):
     source = body.grounding_source or "documents"
+    packed = build_chat_message(body.message, body.selection)
+    # Log enough to debug "answered the wrong case" without dumping full PDFs.
+    sel = (body.selection or "").strip()
+    print(
+        f"[chat] source={source} matter={body.matter_id} "
+        f"q_len={len(body.message)} sel_len={len(sel)} "
+        f"q_preview={body.message[:120]!r} "
+        f"sel_preview={sel[:160]!r}"
+    )
     result = prep_graph.invoke(
         {
-            "messages": [HumanMessage(content=body.message)],
+            "messages": [HumanMessage(content=packed)],
             "matter_id": body.matter_id,
             "grounding_source": source,
             "evidence": [],

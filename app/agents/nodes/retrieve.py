@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage
 
 from app.agents.state import PrepState
 from app.grounding.schemas import EvidenceHit, SourceType
+from app.grounding.selection import extract_selection, retrieval_query
 from app.rag.store import load_store
 
 
@@ -16,7 +17,7 @@ def _guess_source_type(source: str) -> SourceType:
     name = source.lower()
     if "record" in name or name.startswith("r.") or "bronner" in name and "guide" not in name:
         return "record"
-    if "note" in name:
+    if "note" in name or source.startswith("(selected"):
         return "user_note"
     if "law review" in name or "nyu" in name or "villanova" in name:
         return "secondary"
@@ -32,9 +33,33 @@ def _latest_user_text(state: PrepState) -> str:
 
 
 def retrieve_node(state: PrepState) -> dict:
-    question = _latest_user_text(state)
+    message = _latest_user_text(state)
+    query = retrieval_query(message)
+    selection = extract_selection(message)
     store = load_store()
-    if store is None or not question.strip():
+
+    evidence: list[EvidenceHit] = []
+
+    # Always put the highlight first so "what does this mean?" cannot be
+    # answered from an unrelated Fourth Amendment chunk while ignoring Padilla.
+    if selection:
+        evidence.append(
+            {
+                "id": "ev-0",
+                "text": selection,
+                "source": "(selected passage)",
+                "page": None,
+                "source_type": "user_note",
+                "score": 0.0,
+            }
+        )
+
+    if store is None or not query.strip():
+        if evidence:
+            return {
+                "evidence": evidence,
+                "grounding_notes": "Using the selected passage only (index empty or query blank).",
+            }
         return {
             "evidence": [],
             "grounding_status": "no_evidence",
@@ -43,15 +68,18 @@ def retrieve_node(state: PrepState) -> dict:
 
     # similarity_search_with_score returns (Document, score). Lower distance
     # is better for L2; we keep the raw score for abstain heuristics.
-    pairs = store.similarity_search_with_score(question, k=5)
-    evidence: list[EvidenceHit] = []
-    for i, (doc, score) in enumerate(pairs):
+    pairs = store.similarity_search_with_score(query, k=5)
+    for doc, score in pairs:
         meta = doc.metadata or {}
         source = str(meta.get("source", "unknown"))
+        text = doc.page_content or ""
+        # Skip near-duplicates of the selection we already injected.
+        if selection and text.strip() == selection.strip():
+            continue
         evidence.append(
             {
-                "id": f"ev-{i}",
-                "text": doc.page_content,
+                "id": f"ev-{len(evidence)}",
+                "text": text,
                 "source": source,
                 "page": meta.get("page"),
                 "source_type": _guess_source_type(source),
@@ -59,7 +87,11 @@ def retrieve_node(state: PrepState) -> dict:
             }
         )
 
+    notes = f"Retrieved {len(evidence)} passage(s)."
+    if selection:
+        notes += " Selected highlight is evidence[0] and drove the retrieval query."
+
     return {
         "evidence": evidence,
-        "grounding_notes": f"Retrieved {len(evidence)} passages from uploaded articles.",
+        "grounding_notes": notes,
     }
