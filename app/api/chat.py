@@ -31,6 +31,10 @@ class ChatRequest(BaseModel):
     # clients; when present it is packed into the graph message so retrieval
     # and the model actually see what the user selected.
     selection: str | None = None
+    # Which uploaded PDF the highlight came from (filename as stored in FAISS).
+    source_file: str | None = None
+    # 1-based PDF page of the highlight, when known.
+    page: int | None = None
 
 
 class EvidenceOut(BaseModel):
@@ -56,12 +60,19 @@ class ChatResponse(BaseModel):
 @router.post("", response_model=ChatResponse)
 def chat(body: ChatRequest):
     source = body.grounding_source or "documents"
-    packed = build_chat_message(body.message, body.selection)
+    packed = build_chat_message(
+        body.message,
+        body.selection,
+        source_file=body.source_file,
+        page=body.page,
+    )
     # Log enough to debug "answered the wrong case" without dumping full PDFs.
     sel = (body.selection or "").strip()
+    src = (body.source_file or "").strip()
     print(
         f"[chat] source={source} matter={body.matter_id} "
         f"q_len={len(body.message)} sel_len={len(sel)} "
+        f"file={src!r} page={body.page!r} "
         f"q_preview={body.message[:120]!r} "
         f"sel_preview={sel[:160]!r}"
     )

@@ -106,12 +106,59 @@ def list_index_sources() -> list[dict]:
 
 
 def _source_matches(metadata_source: str, target: str) -> bool:
+    if not target:
+        return False
     if metadata_source == target:
         return True
     # Allow DELETE by bare filename when metadata stores the upload name.
     if metadata_source.endswith(target) and target.lower().endswith(".pdf"):
         return True
+    # Match basename either way (uploads sometimes store a path prefix).
+    meta_base = Path(metadata_source).name.lower()
+    target_base = Path(target).name.lower()
+    if meta_base and target_base and meta_base == target_base:
+        return True
     return False
+
+
+def docs_for_source(
+    store: FAISS,
+    source: str,
+    *,
+    page: int | None = None,
+    page_window: int = 1,
+    limit: int = 6,
+) -> list[tuple[Document, float]]:
+    """
+    Pull chunks from one uploaded PDF, optionally near a page.
+
+    Used when Ask AI opens from a highlight so the model sees the same article
+    the student is reading, not a random Bronner / Oyez neighbor.
+    """
+    if store is None or not (source or "").strip():
+        return []
+
+    scored: list[tuple[Document, float]] = []
+    for doc in _all_documents(store):
+        meta = doc.metadata or {}
+        metadata_source = str(meta.get("source") or "")
+        if not _source_matches(metadata_source, source):
+            continue
+        doc_page = meta.get("page")
+        distance = 0.05
+        if page is not None and doc_page is not None:
+            try:
+                delta = abs(int(doc_page) - int(page))
+            except (TypeError, ValueError):
+                delta = 0
+            if delta > page_window:
+                continue
+            # Same page first, then neighbors.
+            distance = 0.01 + (0.02 * delta)
+        scored.append((doc, distance))
+
+    scored.sort(key=lambda item: (item[1], str((item[0].metadata or {}).get("page") or "")))
+    return scored[:limit]
 
 
 def remove_source_from_index(source: str) -> int:
