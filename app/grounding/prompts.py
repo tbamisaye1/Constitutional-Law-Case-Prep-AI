@@ -101,14 +101,54 @@ Output format (plain text):
 """
 
 
-def build_reason_user_payload(question: str, evidence_block: str) -> str:
-    """Pack question + evidence so the model cannot 'forget' the corpus."""
-    return (
-        "EVIDENCE (you may only rely on this, plus any SELECTED PASSAGE in the question):\n"
-        f"{evidence_block}\n\n"
-        "QUESTION:\n"
-        f"{question}\n"
-    )
+def build_reason_user_payload(
+    question: str,
+    evidence_block: str,
+    history: list[dict] | None = None,
+) -> str:
+    """Pack question + evidence (+ optional prior turns) for the reason model."""
+    parts = [
+        "EVIDENCE (you may only rely on this, plus any SELECTED PASSAGE in the question):",
+        evidence_block,
+    ]
+    hist_block = format_chat_history(history)
+    if hist_block:
+        parts.extend(
+            [
+                "",
+                "CONVERSATION SO FAR (follow-ups refer to this; still ground claims in EVIDENCE):",
+                hist_block,
+            ]
+        )
+    parts.extend(["", "QUESTION:", question])
+    return "\n".join(parts)
+
+
+def format_chat_history(history: list[dict] | None, *, max_chars: int = 9000) -> str:
+    """Render prior user/assistant turns for the reason prompt (newest-first budget)."""
+    if not history:
+        return ""
+    cleaned: list[str] = []
+    for turn in history:
+        role = str(turn.get("role") or "").strip().lower()
+        content = str(turn.get("content") or "").strip()
+        if not content or role not in ("user", "assistant"):
+            continue
+        label = "User" if role == "user" else "Ask AI"
+        cleaned.append(f"{label}: {content}")
+    if not cleaned:
+        return ""
+
+    kept: list[str] = []
+    used = 0
+    for piece in reversed(cleaned):
+        cost = len(piece) + (2 if kept else 0)
+        if used + cost > max_chars:
+            break
+        kept.append(piece)
+        used += cost
+    kept.reverse()
+    return "\n\n".join(kept)
 
 
 ABSTAIN_TEMPLATE = (

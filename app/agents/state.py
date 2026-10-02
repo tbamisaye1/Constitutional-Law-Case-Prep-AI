@@ -27,3 +27,5 @@ class PrepState(TypedDict):
     grounding_status: NotRequired[GroundingStatus]
     claims: NotRequired[list[Claim]]
     grounding_notes: NotRequired[str]
+    # Prior Ask AI turns (user/assistant), excluding the current packed question.
+    chat_history: NotRequired[list[dict]]

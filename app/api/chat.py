@@ -23,6 +23,11 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 GroundingSourceIn = Literal["documents", "web_plus"]
 
 
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1)
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     matter_id: str = "bronner-2026"
@@ -35,6 +40,8 @@ class ChatRequest(BaseModel):
     source_file: str | None = None
     # 1-based PDF page of the highlight, when known.
     page: int | None = None
+    # Prior turns in this Ask AI thread (not including the current message).
+    history: list[ChatTurn] | None = None
 
 
 class EvidenceOut(BaseModel):
@@ -66,13 +73,18 @@ def chat(body: ChatRequest):
         source_file=body.source_file,
         page=body.page,
     )
+    history = [
+        {"role": turn.role, "content": turn.content.strip()}
+        for turn in (body.history or [])
+        if turn.content and turn.content.strip()
+    ][-12:]
     # Log enough to debug "answered the wrong case" without dumping full PDFs.
     sel = (body.selection or "").strip()
     src = (body.source_file or "").strip()
     print(
         f"[chat] source={source} matter={body.matter_id} "
         f"q_len={len(body.message)} sel_len={len(sel)} "
-        f"file={src!r} page={body.page!r} "
+        f"file={src!r} page={body.page!r} hist={len(history)} "
         f"q_preview={body.message[:120]!r} "
         f"sel_preview={sel[:160]!r}"
     )
@@ -81,6 +93,7 @@ def chat(body: ChatRequest):
             "messages": [HumanMessage(content=packed)],
             "matter_id": body.matter_id,
             "grounding_source": source,
+            "chat_history": history,
             "evidence": [],
         }
     )

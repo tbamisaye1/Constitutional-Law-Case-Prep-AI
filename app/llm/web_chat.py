@@ -125,26 +125,49 @@ def extract_openai_response(data: dict[str, Any]) -> tuple[str, list[EvidenceHit
     return "\n".join(text_parts).strip(), hits
 
 
-def _build_user_content(question: str, corpus_evidence: list[EvidenceHit]) -> str:
+def _build_user_content(
+    question: str,
+    corpus_evidence: list[EvidenceHit],
+    history: list[dict] | None = None,
+) -> str:
+    from app.grounding.prompts import format_chat_history
+
     corpus_block = _format_corpus_block(corpus_evidence)
-    return (
-        "UPLOADED ARTICLES (prefer these when they match the selected passage / question):\n"
-        f"{corpus_block}\n\n"
-        "QUESTION (may include a SELECTED PASSAGE — if so, explain that passage):\n"
-        f"{question}\n\n"
-        "If there is a SELECTED PASSAGE, ground the answer in that text and any matching "
-        "uploaded passages. Do not pivot to an unrelated case or doctrine from other chunks. "
-        "If the uploaded passages are enough, answer from them and cite [ev-N]. "
-        "If you need outside definitions or background on the named case/statute, "
-        "use web search. Cite web sources with title + URL. "
-        "Do not invent facts that appear in neither the selected passage, uploaded passages, nor search results."
+    parts = [
+        "UPLOADED ARTICLES (prefer these when they match the selected passage / question):",
+        corpus_block,
+    ]
+    hist_block = format_chat_history(history)
+    if hist_block:
+        parts.extend(
+            [
+                "",
+                "CONVERSATION SO FAR (follow-ups refer to this; still ground claims in evidence):",
+                hist_block,
+            ]
+        )
+    parts.extend(
+        [
+            "",
+            "QUESTION (may include a SELECTED PASSAGE — if so, explain that passage):",
+            question,
+            "",
+            "If there is a SELECTED PASSAGE, ground the answer in that text and any matching "
+            "uploaded passages. Do not pivot to an unrelated case or doctrine from other chunks. "
+            "If the uploaded passages are enough, answer from them and cite [ev-N]. "
+            "If you need outside definitions or background on the named case/statute, "
+            "use web search. Cite web sources with title + URL. "
+            "Do not invent facts that appear in neither the selected passage, uploaded passages, nor search results.",
+        ]
     )
+    return "\n".join(parts)
 
 
 def _chat_with_openai(
     question: str,
     corpus_evidence: list[EvidenceHit],
     system_prompt: str,
+    history: list[dict] | None = None,
 ) -> tuple[str, list[EvidenceHit], str]:
     """Use OpenAI's Responses API with its hosted web_search tool."""
     s = get_settings()
@@ -154,7 +177,7 @@ def _chat_with_openai(
         "tool_choice": "auto",
         "input": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": _build_user_content(question, corpus_evidence)},
+            {"role": "user", "content": _build_user_content(question, corpus_evidence, history)},
         ],
     }
     headers = {
@@ -180,10 +203,11 @@ def _chat_with_openrouter(
     question: str,
     corpus_evidence: list[EvidenceHit],
     system_prompt: str,
+    history: list[dict] | None = None,
 ) -> tuple[str, list[EvidenceHit], str]:
     """Fallback: OpenRouter Chat Completions plus openrouter:web_search."""
     s = get_settings()
-    user_content = _build_user_content(question, corpus_evidence)
+    user_content = _build_user_content(question, corpus_evidence, history)
 
     body: dict[str, Any] = {
         "model": s.openrouter_model,
@@ -254,6 +278,7 @@ def chat_with_web_search(
     corpus_evidence: list[EvidenceHit],
     *,
     system_prompt: str,
+    history: list[dict] | None = None,
 ) -> tuple[str, list[EvidenceHit], str]:
     """
     Prefer direct OpenAI web search when OPENAI_API_KEY exists.
@@ -262,7 +287,7 @@ def chat_with_web_search(
     """
     s = get_settings()
     if s.openai_api_key:
-        return _chat_with_openai(question, corpus_evidence, system_prompt)
+        return _chat_with_openai(question, corpus_evidence, system_prompt, history)
     if s.openrouter_api_key:
-        return _chat_with_openrouter(question, corpus_evidence, system_prompt)
+        return _chat_with_openrouter(question, corpus_evidence, system_prompt, history)
     raise RuntimeError("OPENAI_API_KEY and OPENROUTER_API_KEY are both missing")

@@ -72,7 +72,8 @@ def _reason_documents(state: PrepState) -> dict:
         }
 
     question = _latest_user_text(state)
-    payload = build_reason_user_payload(question, _format_evidence(evidence))
+    history = list(state.get("chat_history") or [])
+    payload = build_reason_user_payload(question, _format_evidence(evidence), history)
     model = get_chat_model()
     response = model.invoke(
         [
@@ -128,6 +129,7 @@ def _reason_web_plus(state: PrepState) -> dict:
             question,
             evidence,
             system_prompt=WEB_PLUS_SYSTEM,
+            history=list(state.get("chat_history") or []),
         )
     except Exception as exc:  # noqa: BLE001 — surface API failures as abstain, not 500
         return {
