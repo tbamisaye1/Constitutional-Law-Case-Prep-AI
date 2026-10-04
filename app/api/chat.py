@@ -28,6 +28,22 @@ class ChatTurn(BaseModel):
     content: str = Field(min_length=1)
 
 
+class NotebookNoteIn(BaseModel):
+    """A short local note chunk searched in the browser (not uploaded to FAISS).
+
+    Covers OneNote notebook pages, PDF annotations, and case-library tabs.
+    """
+
+    id: str = "note"
+    title: str = "Untitled note"
+    text: str = Field(min_length=1)
+    section_name: str | None = None
+    page_id: str | None = None
+    notes_path: str | None = None
+    source_type: str | None = None
+    page: int | None = None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     matter_id: str = "bronner-2026"
@@ -42,6 +58,8 @@ class ChatRequest(BaseModel):
     page: int | None = None
     # Prior turns in this Ask AI thread (not including the current message).
     history: list[ChatTurn] | None = None
+    # Opt-in notebook evidence from this browser's localStorage notebook.
+    notes: list[NotebookNoteIn] | None = None
 
 
 class EvidenceOut(BaseModel):
@@ -51,6 +69,7 @@ class EvidenceOut(BaseModel):
     source_type: str
     preview: str
     url: str | None = None
+    notes_path: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -78,6 +97,20 @@ def chat(body: ChatRequest):
         for turn in (body.history or [])
         if turn.content and turn.content.strip()
     ][-12:]
+    client_notes = [
+        {
+            "id": n.id,
+            "title": n.title,
+            "text": n.text.strip(),
+            "section_name": n.section_name,
+            "page_id": n.page_id,
+            "notes_path": n.notes_path,
+            "source_type": n.source_type,
+            "page": n.page,
+        }
+        for n in (body.notes or [])
+        if n.text and n.text.strip()
+    ][:8]
     # Log enough to debug "answered the wrong case" without dumping full PDFs.
     sel = (body.selection or "").strip()
     src = (body.source_file or "").strip()
@@ -85,6 +118,7 @@ def chat(body: ChatRequest):
         f"[chat] source={source} matter={body.matter_id} "
         f"q_len={len(body.message)} sel_len={len(sel)} "
         f"file={src!r} page={body.page!r} hist={len(history)} "
+        f"notes={len(client_notes)} "
         f"q_preview={body.message[:120]!r} "
         f"sel_preview={sel[:160]!r}"
     )
@@ -94,6 +128,7 @@ def chat(body: ChatRequest):
             "matter_id": body.matter_id,
             "grounding_source": source,
             "chat_history": history,
+            "client_notes": client_notes,
             "evidence": [],
         }
     )
@@ -112,6 +147,7 @@ def chat(body: ChatRequest):
             source_type=e.get("source_type", "unknown"),
             preview=(e.get("text") or "")[:220],
             url=e.get("url"),
+            notes_path=e.get("notes_path"),
         )
         for e in evidence_raw
     ]

@@ -1,8 +1,11 @@
 """
 Retrieve node: pull FAISS chunks for the latest user question.
 
-If the index is empty, we still continue the graph, but abstain rules in
-reason_node will refuse to invent an answer. That is intentional.
+Also merges optional client notebook notes (browser-local) that Ask AI
+sent with the request when the user opted into "Include my notes".
+
+If the index is empty and there are no notes, we still continue the graph,
+but abstain rules in reason_node will refuse to invent an answer.
 """
 
 from langchain_core.messages import HumanMessage
@@ -45,6 +48,8 @@ def _append_hit(
     page,
     source_type: SourceType,
     score: float | None,
+    url: str | None = None,
+    notes_path: str | None = None,
 ) -> None:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -53,16 +58,55 @@ def _append_hit(
     for existing in evidence:
         if (existing.get("text") or "").strip() == cleaned:
             return
-    evidence.append(
-        {
-            "id": f"ev-{len(evidence)}",
-            "text": cleaned,
-            "source": source,
-            "page": page,
-            "source_type": source_type,
-            "score": float(score) if score is not None else None,
-        }
-    )
+    hit: EvidenceHit = {
+        "id": f"ev-{len(evidence)}",
+        "text": cleaned,
+        "source": source,
+        "page": page,
+        "source_type": source_type,
+        "score": float(score) if score is not None else None,
+    }
+    if url:
+        hit["url"] = url
+    if notes_path:
+        hit["notes_path"] = notes_path
+    evidence.append(hit)
+
+
+_LOCAL_NOTE_TYPES = frozenset({"notebook", "annotation", "user_note"})
+
+
+def _merge_client_notes(evidence: list[EvidenceHit], client_notes: list[dict] | None) -> int:
+    """Append browser-searched notebook pages / PDF annotations. Returns how many were added."""
+    added = 0
+    for note in client_notes or []:
+        text = str(note.get("text") or "").strip()
+        if not text:
+            continue
+        title = str(note.get("title") or "Untitled note").strip() or "Untitled note"
+        section = str(note.get("section_name") or "").strip()
+        raw_type = str(note.get("source_type") or "notebook").strip().lower()
+        source_type = raw_type if raw_type in _LOCAL_NOTE_TYPES else "notebook"
+        page_raw = note.get("page")
+        page = int(page_raw) if isinstance(page_raw, int) and page_raw > 0 else None
+        if source_type == "annotation":
+            label = f"{title} (Annotation · {section})" if section else f"{title} (Annotation)"
+        else:
+            label = f"{title} (Notes · {section})" if section else f"{title} (Notes)"
+        path = str(note.get("notes_path") or "").strip() or None
+        before = len(evidence)
+        _append_hit(
+            evidence,
+            text=text,
+            source=label,
+            page=page,
+            source_type=source_type,
+            score=0.0,
+            notes_path=path,
+        )
+        if len(evidence) > before:
+            added += 1
+    return added
 
 
 def retrieve_node(state: PrepState) -> dict:
@@ -72,6 +116,7 @@ def retrieve_node(state: PrepState) -> dict:
     source_file = extract_source_file(message)
     source_page = extract_source_page(message)
     store = load_store()
+    client_notes = list(state.get("client_notes") or [])
 
     evidence: list[EvidenceHit] = []
 
@@ -88,11 +133,23 @@ def retrieve_node(state: PrepState) -> dict:
             score=0.0,
         )
 
+    # Notebook pages + PDF annotations the browser matched locally (opt-in).
+    # Prefer early so "what did I write about NDAA" is not drowned by FAISS hits.
+    notes_added = _merge_client_notes(evidence, client_notes)
+
     if store is None or not query.strip():
         if evidence:
+            note_bit = (
+                f" Including {notes_added} local note/annotation chunk(s)."
+                if notes_added
+                else ""
+            )
             return {
                 "evidence": evidence,
-                "grounding_notes": "Using the selected passage only (index empty or query blank).",
+                "grounding_notes": (
+                    "Using selected passage and/or your notes/annotations only "
+                    f"(index empty or query blank).{note_bit}"
+                ),
             }
         return {
             "evidence": [],
@@ -133,12 +190,21 @@ def retrieve_node(state: PrepState) -> dict:
             score=float(score) if score is not None else None,
         )
 
-    # Cap so the reason prompt stays readable.
-    evidence = evidence[:8]
+    # Cap so the reason prompt stays readable. Prefer local notes + selection.
+    local_types = ("notebook", "user_note", "annotation")
+    local = [e for e in evidence if e.get("source_type") in local_types]
+    corpus = [e for e in evidence if e.get("source_type") not in local_types]
+    keep_local = local[:6]
+    keep_corpus = corpus[: max(0, 10 - len(keep_local))]
+    evidence = keep_local + keep_corpus
+    for i, hit in enumerate(evidence):
+        hit["id"] = f"ev-{i}"
 
     notes = f"Retrieved {len(evidence)} passage(s)."
+    if notes_added:
+        notes += f" Included {notes_added} local note/annotation chunk(s) from this browser."
     if selection:
-        notes += " Selected highlight is evidence[0] and drove the retrieval query."
+        notes += " Selected highlight is early evidence and drove the retrieval query."
     if source_file:
         notes += f" Preferred source article: {source_file}"
         if source_page is not None:

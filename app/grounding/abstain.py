@@ -29,8 +29,22 @@ def should_abstain(evidence: list[EvidenceHit]) -> tuple[bool, str]:
     if total_chars < MIN_EVIDENCE_CHARS:
         return True, "Retrieved text is too short to support a legal claim."
 
-    scored = [e for e in evidence if e.get("score") is not None]
-    if scored and all((e["score"] or 999) > MAX_L2_DISTANCE for e in scored):
+    # Notebook + selected-passage hits are client-supplied, not FAISS L2.
+    # Do not abstain just because every *vector* hit is far when notes are present.
+    has_local = any(
+        e.get("source_type") in ("notebook", "user_note", "annotation") for e in evidence
+    )
+    scored = [
+        e
+        for e in evidence
+        if e.get("score") is not None
+        and e.get("source_type") not in ("notebook", "user_note", "annotation")
+    ]
+    if (
+        not has_local
+        and scored
+        and all((e["score"] or 999) > MAX_L2_DISTANCE for e in scored)
+    ):
         return True, "Retrieval distances are high; the question may be outside the corpus."
 
     return False, ""

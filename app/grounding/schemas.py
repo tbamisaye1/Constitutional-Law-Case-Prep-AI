@@ -9,7 +9,16 @@ evidence. That makes the verify node mechanical (string match) instead of
 from typing import Literal, NotRequired, TypedDict
 
 
-SourceType = Literal["record", "precedent", "secondary", "user_note", "web", "unknown"]
+SourceType = Literal[
+    "record",
+    "precedent",
+    "secondary",
+    "user_note",
+    "notebook",
+    "annotation",
+    "web",
+    "unknown",
+]
 
 GroundingStatus = Literal["grounded", "partial", "abstained", "unverified", "no_evidence"]
 
@@ -25,6 +34,8 @@ class EvidenceHit(TypedDict):
     score: float | None
     # Present when source_type is "web" (OpenRouter url citation).
     url: NotRequired[str]
+    # Present when source_type is "notebook" (deep link into /notes).
+    notes_path: NotRequired[str]
 
 
 class Claim(TypedDict):
