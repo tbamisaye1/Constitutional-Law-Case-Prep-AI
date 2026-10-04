@@ -16,6 +16,10 @@ import httpx
 from app.config import get_settings
 from app.grounding.schemas import EvidenceHit
 
+# Keep under Vercel maxDuration (300s on Pro). Old 90s client timeout sat
+# above the previous 60s function cap and surfaced as FUNCTION_INVOCATION_TIMEOUT.
+WEB_HTTP_TIMEOUT_S = 120.0
+
 
 def _format_corpus_block(evidence: list[EvidenceHit]) -> str:
     if not evidence:
@@ -173,7 +177,7 @@ def _chat_with_openai(
     s = get_settings()
     body: dict[str, Any] = {
         "model": s.openai_web_model,
-        "tools": [{"type": "web_search", "search_context_size": "medium"}],
+        "tools": [{"type": "web_search", "search_context_size": "low"}],
         "tool_choice": "auto",
         "input": [
             {"role": "system", "content": system_prompt},
@@ -185,11 +189,16 @@ def _chat_with_openai(
         "Content-Type": "application/json",
     }
 
-    with httpx.Client(timeout=90.0) as client:
-        res = client.post("https://api.openai.com/v1/responses", headers=headers, json=body)
-        if res.status_code >= 400:
-            raise RuntimeError(f"OpenAI web search failed ({res.status_code}): {res.text[:800]}")
-        data = res.json()
+    try:
+        with httpx.Client(timeout=WEB_HTTP_TIMEOUT_S) as client:
+            res = client.post("https://api.openai.com/v1/responses", headers=headers, json=body)
+            if res.status_code >= 400:
+                raise RuntimeError(f"OpenAI web search failed ({res.status_code}): {res.text[:800]}")
+            data = res.json()
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            "Web search timed out. Try Uploaded articles mode, or ask a narrower question."
+        ) from exc
 
     reply, web_hits = extract_openai_response(data)
     notes = (
@@ -221,12 +230,12 @@ def _chat_with_openrouter(
                 "type": "openrouter:web_search",
                 "parameters": {
                     "engine": "auto",
-                    "max_results": 5,
-                    "max_total_results": 10,
+                    "max_results": 4,
+                    "max_total_results": 8,
                 },
             }
         ],
-        "max_tool_calls": 4,
+        "max_tool_calls": 2,
     }
 
     url = f"{s.openrouter_base_url.rstrip('/')}/chat/completions"
@@ -237,12 +246,17 @@ def _chat_with_openrouter(
         "X-Title": "Case Prep Ask AI Web",
     }
 
-    with httpx.Client(timeout=90.0) as client:
-        res = client.post(url, headers=headers, json=body)
-        if res.status_code >= 400:
-            detail = res.text[:800]
-            raise RuntimeError(f"OpenRouter web chat failed ({res.status_code}): {detail}")
-        data = res.json()
+    try:
+        with httpx.Client(timeout=WEB_HTTP_TIMEOUT_S) as client:
+            res = client.post(url, headers=headers, json=body)
+            if res.status_code >= 400:
+                detail = res.text[:800]
+                raise RuntimeError(f"OpenRouter web chat failed ({res.status_code}): {detail}")
+            data = res.json()
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(
+            "Web search timed out. Try Uploaded articles mode, or ask a narrower question."
+        ) from exc
 
     choices = data.get("choices") or []
     if not choices:
