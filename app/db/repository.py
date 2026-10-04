@@ -110,8 +110,9 @@ ENTITIES: tuple[EntitySpec, ...] = (
             ("rects", "rects"),
             ("pinned", "pinned"),
             ("color", "color"),
+            ("topics", "topics"),
         ),
-        json_fields=frozenset({"rects"}),
+        json_fields=frozenset({"rects", "topics"}),
     ),
     EntitySpec(
         name="notes",
@@ -162,6 +163,7 @@ _PUSH_DEFAULTS: dict[str, dict[str, Any]] = {
         "text": "",
         "pinned": False,
         "color": "gold",
+        "topics": [],
     },
     "notes": {"html": ""},
     "library_records": {"data": {}},
