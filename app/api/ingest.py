@@ -190,7 +190,8 @@ async def ingest_blob_client_upload(request: Request) -> dict:
     try:
         client_token = generate_client_token(
             pathname,
-            allowed_content_types=["application/pdf"],
+            # Match /documents: some browsers label PDFs as octet-stream.
+            allowed_content_types=["application/pdf", "application/octet-stream"],
             maximum_size_in_bytes=MAX_DIRECT_UPLOAD_BYTES,
             add_random_suffix=False,
             allow_overwrite=False,

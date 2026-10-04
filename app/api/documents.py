@@ -215,7 +215,10 @@ async def blob_client_upload(
     try:
         client_token = generate_client_token(
             pathname,
-            allowed_content_types=["application/pdf"],
+            # Some browsers send empty / octet-stream for PDFs. Accept those
+            # too so the PUT is not rejected (which often shows up as a bare
+            # "Failed to fetch" in the browser when CORS hides the 400).
+            allowed_content_types=["application/pdf", "application/octet-stream"],
             maximum_size_in_bytes=MAX_DIRECT_UPLOAD_BYTES,
             add_random_suffix=False,
             allow_overwrite=False,
