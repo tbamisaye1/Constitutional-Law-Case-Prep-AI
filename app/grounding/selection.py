@@ -27,9 +27,13 @@ _USER_QUESTION = re.compile(
 )
 
 # Ask AI "instant case" / "case at bar" = Bronner record, not a library case.
+# Allow common typos (instatnt, instnat, istant) so Instant Case boost still fires.
 _INSTANT_CASE_RE = re.compile(
-    r"\binstant\s+cases?\b|\bcase\s+at\s+bar\b|\bbobby\s+bronner\b|"
-    r"\bbronner\s+v\.?\s*(?:usa|united\s+states)\b",
+    r"\binsta\w{0,6}\s+cases?\b|"
+    r"\bcase\s+at\s+bar\b|"
+    r"\bbobby\s+bronner\b|"
+    r"\bbronner\s+v\.?\s*(?:usa|united\s+states)\b|"
+    r"\bbronner\b",
     re.IGNORECASE,
 )
 

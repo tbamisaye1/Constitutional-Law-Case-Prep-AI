@@ -70,6 +70,8 @@ def test_build_without_selection_is_plain():
 def test_instant_case_aliases_mean_bronner():
     assert mentions_instant_case("facts in the instant case")
     assert mentions_instant_case("what does the case at bar say about standing")
+    assert mentions_instant_case("Go throguht the instatnt case, what were gov arguments")
+    assert mentions_instant_case("bronner appellate reasoning")
     assert not mentions_instant_case("summarize Hamdi")
     expanded = expand_instant_case_aliases("standing in the instant case")
     assert "Bronner" in expanded
@@ -77,3 +79,9 @@ def test_instant_case_aliases_mean_bronner():
     query = retrieval_query("standing issues in the instant case")
     assert "Bronner" in query
     assert "instant case" in query.lower()
+    # Typo path must expand too, or Instant Case boost never runs.
+    typo_q = retrieval_query(
+        "Go throguht the instatnt case, Appellate Court reasoning for president authority"
+    )
+    assert "Bronner" in typo_q
+
