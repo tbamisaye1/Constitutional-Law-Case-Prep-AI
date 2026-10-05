@@ -20,7 +20,7 @@ from app.grounding.prompts import (
     build_reason_user_payload,
 )
 from app.grounding.schemas import EvidenceHit
-from app.llm.openrouter import get_chat_model
+from app.llm.openrouter import get_chat_model, normalize_model_tier, resolve_chat_model_id
 
 
 def _format_evidence(evidence: list[EvidenceHit]) -> str:
@@ -30,7 +30,13 @@ def _format_evidence(evidence: list[EvidenceHit]) -> str:
     for e in evidence:
         page = f" p.{e['page']}" if e.get("page") else ""
         url = e.get("url")
-        loc = f" {url}" if url else page
+        notes_path = e.get("notes_path")
+        if url:
+            loc = f" {url}"
+        elif notes_path:
+            loc = f" {notes_path}"
+        else:
+            loc = page
         lines.append(
             f"[{e['id']}] ({e['source_type']}) {e['source']}{loc}\n{e['text']}\n"
         )
@@ -74,16 +80,20 @@ def _reason_documents(state: PrepState) -> dict:
     question = _latest_user_text(state)
     history = list(state.get("chat_history") or [])
     payload = build_reason_user_payload(question, _format_evidence(evidence), history)
-    model = get_chat_model()
+    tier = normalize_model_tier(state.get("model_tier"))
+    model_id = resolve_chat_model_id(tier)
+    model = get_chat_model(tier)
     response = model.invoke(
         [
             SystemMessage(content=GROUNDED_LEGAL_SYSTEM),
             HumanMessage(content=payload),
         ]
     )
+    notes = f"Model: {model_id} ({tier})."
     return {
         "messages": [response],
         "grounding_status": "unverified",
+        "grounding_notes": notes,
     }
 
 
@@ -124,12 +134,14 @@ def _reason_web_plus(state: PrepState) -> dict:
             "grounding_notes": "Missing web-search API key.",
         }
 
+    tier = normalize_model_tier(state.get("model_tier"))
     try:
         reply, web_hits, notes = chat_with_web_search(
             question,
             evidence,
             system_prompt=WEB_PLUS_SYSTEM,
             history=list(state.get("chat_history") or []),
+            model_tier=tier,
         )
     except Exception as exc:  # noqa: BLE001 — surface API failures as abstain, not 500
         return {
@@ -141,6 +153,7 @@ def _reason_web_plus(state: PrepState) -> dict:
         }
 
     merged = list(evidence) + list(web_hits)
+    tier_note = f" Model tier: {tier}."
     if not reply.strip():
         return {
             "messages": [
@@ -152,14 +165,14 @@ def _reason_web_plus(state: PrepState) -> dict:
             ],
             "grounding_status": "abstained",
             "claims": [],
-            "grounding_notes": notes,
+            "grounding_notes": f"{notes}{tier_note}",
             "evidence": merged,
         }
 
     return {
         "messages": [AIMessage(content=reply)],
         "grounding_status": "unverified",
-        "grounding_notes": notes,
+        "grounding_notes": f"{notes}{tier_note}",
         "evidence": merged,
     }
 

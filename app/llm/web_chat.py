@@ -172,11 +172,21 @@ def _chat_with_openai(
     corpus_evidence: list[EvidenceHit],
     system_prompt: str,
     history: list[dict] | None = None,
+    *,
+    model_tier: str = "standard",
 ) -> tuple[str, list[EvidenceHit], str]:
     """Use OpenAI's Responses API with its hosted web_search tool."""
     s = get_settings()
+    from app.llm.openrouter import normalize_model_tier
+
+    tier = normalize_model_tier(model_tier)
+    model = (
+        (s.openai_advanced_web_model or s.openai_web_model).strip()
+        if tier == "advanced"
+        else (s.openai_web_model or "gpt-5-mini").strip()
+    )
     body: dict[str, Any] = {
-        "model": s.openai_web_model,
+        "model": model,
         "tools": [{"type": "web_search", "search_context_size": "low"}],
         "tool_choice": "auto",
         "input": [
@@ -202,7 +212,7 @@ def _chat_with_openai(
 
     reply, web_hits = extract_openai_response(data)
     notes = (
-        f"Web mode (OpenAI): {len(corpus_evidence)} corpus hit(s), "
+        f"Web mode (OpenAI {model}): {len(corpus_evidence)} corpus hit(s), "
         f"{len(web_hits)} web cite(s)."
     )
     return reply, web_hits, notes
@@ -213,13 +223,18 @@ def _chat_with_openrouter(
     corpus_evidence: list[EvidenceHit],
     system_prompt: str,
     history: list[dict] | None = None,
+    *,
+    model_tier: str = "standard",
 ) -> tuple[str, list[EvidenceHit], str]:
     """Fallback: OpenRouter Chat Completions plus openrouter:web_search."""
+    from app.llm.openrouter import resolve_chat_model_id
+
     s = get_settings()
     user_content = _build_user_content(question, corpus_evidence, history)
+    model = resolve_chat_model_id(model_tier)
 
     body: dict[str, Any] = {
-        "model": s.openrouter_model,
+        "model": model,
         "temperature": 0.2,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -279,7 +294,7 @@ def _chat_with_openrouter(
     tool_use = usage.get("server_tool_use") or {}
     searches = tool_use.get("web_search_requests")
     note_bits = [
-        f"Web mode (OpenRouter): {len(corpus_evidence)} corpus hit(s), "
+        f"Web mode (OpenRouter {model}): {len(corpus_evidence)} corpus hit(s), "
         f"{len(web_hits)} web cite(s)."
     ]
     if searches is not None:
@@ -293,6 +308,7 @@ def chat_with_web_search(
     *,
     system_prompt: str,
     history: list[dict] | None = None,
+    model_tier: str = "standard",
 ) -> tuple[str, list[EvidenceHit], str]:
     """
     Prefer direct OpenAI web search when OPENAI_API_KEY exists.
@@ -301,7 +317,19 @@ def chat_with_web_search(
     """
     s = get_settings()
     if s.openai_api_key:
-        return _chat_with_openai(question, corpus_evidence, system_prompt, history)
+        return _chat_with_openai(
+            question,
+            corpus_evidence,
+            system_prompt,
+            history,
+            model_tier=model_tier,
+        )
     if s.openrouter_api_key:
-        return _chat_with_openrouter(question, corpus_evidence, system_prompt, history)
+        return _chat_with_openrouter(
+            question,
+            corpus_evidence,
+            system_prompt,
+            history,
+            model_tier=model_tier,
+        )
     raise RuntimeError("OPENAI_API_KEY and OPENROUTER_API_KEY are both missing")

@@ -15,6 +15,8 @@ from app.grounding.schemas import Claim, EvidenceHit, GroundingStatus
 
 # documents = FAISS RAG only (default). web_plus = corpus + OpenRouter web search.
 GroundingSource = Literal["documents", "web_plus"]
+# standard = cheap default model. advanced = stronger GPT mini for hard questions.
+ModelTier = Literal["standard", "advanced"]
 
 
 class PrepState(TypedDict):
@@ -22,6 +24,8 @@ class PrepState(TypedDict):
     matter_id: str
     # Ask AI mode. Omitted / documents keeps today's RAG path unchanged.
     grounding_source: NotRequired[GroundingSource]
+    # Ask AI model tier from the UI Advanced responses switch.
+    model_tier: NotRequired[ModelTier]
     # Filled by retrieve; reason and verify read these.
     evidence: NotRequired[list[EvidenceHit]]
     grounding_status: NotRequired[GroundingStatus]
@@ -29,3 +33,6 @@ class PrepState(TypedDict):
     grounding_notes: NotRequired[str]
     # Prior Ask AI turns (user/assistant), excluding the current packed question.
     chat_history: NotRequired[list[dict]]
+    # Optional notebook chunks the browser searched locally and sent with /chat.
+    # Never persisted server-side beyond this request.
+    client_notes: NotRequired[list[dict]]

@@ -34,12 +34,17 @@ class Settings(BaseSettings):
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Ask AI "standard" chat (cheap default).
     openrouter_model: str = "openai/gpt-4o-mini"
+    # Ask AI "Advanced responses" toggle — stronger GPT mini for hard questions.
+    openrouter_advanced_model: str = "openai/gpt-5-mini"
     openrouter_embedding_model: str = "openai/text-embedding-3-small"
     # Direct OpenAI Responses API for Ask AI Web mode. The existing
     # OpenRouter key remains the fallback and still powers PDF embeddings.
     openai_api_key: str = ""
     openai_web_model: str = "gpt-5-mini"
+    # Web mode when Advanced responses is on (still GPT; override via env).
+    openai_advanced_web_model: str = "gpt-5-mini"
     # openrouter (default) | local
     embeddings_backend: str = "openrouter"
     local_embedding_model: str = "BAAI/bge-small-en-v1.5"

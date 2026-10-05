@@ -17,10 +17,12 @@ from pydantic import BaseModel, Field
 
 from app.agents.prep_graph import prep_graph
 from app.grounding.selection import build_chat_message
+from app.llm.openrouter import normalize_model_tier
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 GroundingSourceIn = Literal["documents", "web_plus"]
+ModelTierIn = Literal["standard", "advanced"]
 
 
 class ChatTurn(BaseModel):
@@ -48,6 +50,8 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     matter_id: str = "bronner-2026"
     grounding_source: GroundingSourceIn = "documents"
+    # standard = gpt-4o-mini; advanced = gpt-5-mini (Ask AI Advanced toggle).
+    model_tier: ModelTierIn = "standard"
     # Highlighted PDF / guide text from the Ask AI bubble. Optional for older
     # clients; when present it is packed into the graph message so retrieval
     # and the model actually see what the user selected.
@@ -78,6 +82,7 @@ class ChatResponse(BaseModel):
     grounding_status: str
     grounding_notes: str = ""
     grounding_source: GroundingSourceIn = "documents"
+    model_tier: ModelTierIn = "standard"
     evidence: list[EvidenceOut] = []
     claims_verified: int = 0
     claims_total: int = 0
@@ -86,6 +91,7 @@ class ChatResponse(BaseModel):
 @router.post("", response_model=ChatResponse)
 def chat(body: ChatRequest):
     source = body.grounding_source or "documents"
+    tier = normalize_model_tier(body.model_tier)
     packed = build_chat_message(
         body.message,
         body.selection,
@@ -115,7 +121,7 @@ def chat(body: ChatRequest):
     sel = (body.selection or "").strip()
     src = (body.source_file or "").strip()
     print(
-        f"[chat] source={source} matter={body.matter_id} "
+        f"[chat] source={source} tier={tier} matter={body.matter_id} "
         f"q_len={len(body.message)} sel_len={len(sel)} "
         f"file={src!r} page={body.page!r} hist={len(history)} "
         f"notes={len(client_notes)} "
@@ -127,6 +133,7 @@ def chat(body: ChatRequest):
             "messages": [HumanMessage(content=packed)],
             "matter_id": body.matter_id,
             "grounding_source": source,
+            "model_tier": tier,
             "chat_history": history,
             "client_notes": client_notes,
             "evidence": [],
@@ -158,6 +165,7 @@ def chat(body: ChatRequest):
         grounding_status=result.get("grounding_status") or "unverified",
         grounding_notes=result.get("grounding_notes") or "",
         grounding_source=source,
+        model_tier=tier,
         evidence=evidence_out,
         claims_verified=verified,
         claims_total=len(claims),
