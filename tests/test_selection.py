@@ -1,9 +1,11 @@
 from app.grounding.selection import (
     build_chat_message,
+    expand_instant_case_aliases,
     extract_selection,
     extract_source_file,
     extract_source_page,
     extract_user_question,
+    mentions_instant_case,
     retrieval_query,
 )
 
@@ -60,3 +62,18 @@ def test_build_without_selection_is_plain():
     assert build_chat_message("hello", "") == "hello"
     assert build_chat_message("hello", None) == "hello"
     assert build_chat_message("hello", None, source_file="x.pdf", page=1) == "hello"
+    packed = build_chat_message("facts in the instant case", "")
+    assert "Bronner" in packed
+    assert "instant case" in packed.lower()
+
+
+def test_instant_case_aliases_mean_bronner():
+    assert mentions_instant_case("facts in the instant case")
+    assert mentions_instant_case("what does the case at bar say about standing")
+    assert not mentions_instant_case("summarize Hamdi")
+    expanded = expand_instant_case_aliases("standing in the instant case")
+    assert "Bronner" in expanded
+    assert "Joint Appendix" in expanded
+    query = retrieval_query("standing issues in the instant case")
+    assert "Bronner" in query
+    assert "instant case" in query.lower()

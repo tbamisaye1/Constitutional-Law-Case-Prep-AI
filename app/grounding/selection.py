@@ -26,6 +26,32 @@ _USER_QUESTION = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# Ask AI "instant case" / "case at bar" = Bronner record, not a library case.
+_INSTANT_CASE_RE = re.compile(
+    r"\binstant\s+cases?\b|\bcase\s+at\s+bar\b|\bbobby\s+bronner\b|"
+    r"\bbronner\s+v\.?\s*(?:usa|united\s+states)\b",
+    re.IGNORECASE,
+)
+
+_INSTANT_CASE_EXPANSION = (
+    "Instant Case / case at bar = Bobby Bronner v. United States "
+    "(AMCA moot record / Joint Appendix in this app — not a library precedent)"
+)
+
+
+def mentions_instant_case(text: str) -> bool:
+    return bool(text and _INSTANT_CASE_RE.search(text))
+
+
+def expand_instant_case_aliases(text: str) -> str:
+    """Append Bronner disambiguation when the user says Instant Case."""
+    raw = (text or "").strip()
+    if not raw or not mentions_instant_case(raw):
+        return raw
+    if "bronner" in raw.lower() and "joint appendix" in raw.lower():
+        return raw
+    return f"{raw}\n\n({_INSTANT_CASE_EXPANSION})"
+
 
 def build_chat_message(
     question: str,
@@ -35,7 +61,7 @@ def build_chat_message(
     page: int | None = None,
 ) -> str:
     """Compose the HumanMessage content the agent graph sees."""
-    q = (question or "").strip()
+    q = expand_instant_case_aliases((question or "").strip())
     sel = (selection or "").strip()
     source = (source_file or "").strip()
     if not sel:
@@ -103,6 +129,7 @@ def retrieval_query(message: str) -> str:
     Prefer the selected passage (specific case names, holdings) over a vague
     question like "what does this mean", which otherwise matches random corpus.
     Include the source filename when known so same-PDF chunks rank closer.
+    Expand Instant Case / case-at-bar language to Bronner record terms.
     """
     selection = extract_selection(message)
     question = extract_user_question(message)
@@ -114,6 +141,5 @@ def retrieval_query(message: str) -> str:
         bits.append(question)
     if source:
         bits.append(source)
-    if bits:
-        return "\n\n".join(bits)
-    return (message or "").strip()
+    base = "\n\n".join(bits) if bits else (message or "").strip()
+    return expand_instant_case_aliases(base)

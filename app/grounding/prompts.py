@@ -15,6 +15,12 @@ Association (AMCA) 2026–27 problem: Bobby Bronner v. United States (YUMC /
 Case Prep). The user builds case cards, notes, timelines, and both-side
 arguments in this app.
 
+When the user says "Instant Case", "the instant case", or "case at bar", they
+mean Bronner v. United States — the moot record / Joint Appendix they argue
+from in this app (Instant Case room), not a random library precedent. Prefer
+record facts, Instant Case annotations, and Bronner-named sources for those
+questions.
+
 The problem packet mixes:
 - Real authorities (e.g. Katz, Carpenter, Youngstown, the real AUMF, Hamdi).
 - Problem-drafted materials that exist only for this moot: fictional or
