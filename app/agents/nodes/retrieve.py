@@ -195,11 +195,11 @@ def retrieve_node(state: PrepState) -> dict:
             score=float(score) if score is not None else None,
         )
 
-    # Instant Case questions: force record PDF chunks in even if Hamdi/etc.
-    # ranked higher on raw embedding distance.
+    # Instant Case questions: force query-ranked record chunks in (not caption
+    # pages 1–2). Early-page bias previously made every Bronner ask look empty.
     instant_hits = 0
     if mentions_instant_case(query) or mentions_instant_case(message):
-        for doc, score in docs_for_instant_case(store, limit=5):
+        for doc, score in docs_for_instant_case(store, query, limit=8):
             meta = doc.metadata or {}
             before = len(evidence)
             _append_hit(
@@ -220,9 +220,10 @@ def retrieve_node(state: PrepState) -> dict:
     # Keep Instant Case / record passages when present.
     record = [e for e in corpus if e.get("source_type") == "record"]
     other = [e for e in corpus if e.get("source_type") != "record"]
-    keep_local = local[:5]
-    keep_record = record[:4]
-    keep_other = other[: max(0, 10 - len(keep_local) - len(keep_record))]
+    keep_local = local[:4]
+    # Instant Case hard questions need more record room than library neighbors.
+    keep_record = record[:7] if instant_hits else record[:3]
+    keep_other = other[: max(0, 12 - len(keep_local) - len(keep_record))]
     evidence = keep_local + keep_record + keep_other
     for i, hit in enumerate(evidence):
         hit["id"] = f"ev-{i}"

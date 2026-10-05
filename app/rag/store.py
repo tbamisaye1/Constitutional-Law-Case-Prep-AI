@@ -188,28 +188,59 @@ def docs_for_source(
 
 def docs_for_instant_case(
     store: FAISS,
+    query: str = "",
     *,
-    limit: int = 6,
+    limit: int = 8,
 ) -> list[tuple[Document, float]]:
     """
-    Pull Instant Case / Bronner record chunks so Uploaded docs mode does not
-    answer Instant Case questions only from Hamdi / library neighbors.
+    Pull Instant Case / Bronner record chunks ranked by the question.
+
+    Do not prefer early PDF pages — that used to return only the caption while
+    Instant Case questions about appellate reasoning live later in the record.
     """
     if store is None:
         return []
+
+    q = (query or "").strip()
+    if q:
+        # Over-fetch, then keep Instant Case hits so Hamdi/etc. cannot crowd out
+        # the record when the question is about Bronner.
+        pairs = store.similarity_search_with_score(q, k=max(48, limit * 6))
+        filtered: list[tuple[Document, float]] = []
+        seen: set[str] = set()
+        for doc, score in pairs:
+            meta = doc.metadata or {}
+            source = str(meta.get("source") or "")
+            if not is_instant_case_source(source):
+                continue
+            text = (doc.page_content or "").strip()
+            key = f"{source}|{meta.get('page')}|{text[:120]}"
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            filtered.append((doc, float(score) if score is not None else 1.0))
+            if len(filtered) >= limit:
+                return filtered
+        if filtered:
+            return filtered
+
+    # Keyword fallback when vector search returns no Instant Case rows.
+    import re
+
+    tokens = {t for t in re.findall(r"[a-z0-9]+", q.lower()) if len(t) > 3}
     scored: list[tuple[Document, float]] = []
     for doc in _all_documents(store):
         meta = doc.metadata or {}
         source = str(meta.get("source") or "")
         if not is_instant_case_source(source):
             continue
-        page = meta.get("page")
-        # Prefer early record pages (facts / proceedings) slightly.
-        try:
-            page_n = int(page) if page is not None else 50
-        except (TypeError, ValueError):
-            page_n = 50
-        distance = 0.04 + min(page_n, 40) * 0.001
+        text = (doc.page_content or "").strip()
+        if not text:
+            continue
+        lower = text.lower()
+        hits = sum(1 for t in tokens if t in lower) if tokens else 0
+        # Lower is better (same convention as FAISS L2 distance).
+        distance = 1.0 / (1.0 + hits) if tokens else 0.5
         scored.append((doc, distance))
     scored.sort(key=lambda item: (item[1], str((item[0].metadata or {}).get("page") or "")))
     return scored[:limit]
