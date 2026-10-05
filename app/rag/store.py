@@ -219,10 +219,10 @@ def docs_for_instant_case(
                 continue
             seen.add(key)
             filtered.append((doc, float(score) if score is not None else 1.0))
-            if len(filtered) >= limit:
-                return filtered
         if filtered:
-            return filtered
+            # FAISS L2: lower distance is better. Re-sort after filtering.
+            filtered.sort(key=lambda item: item[1])
+            return filtered[:limit]
 
     # Keyword fallback when vector search returns no Instant Case rows.
     import re
