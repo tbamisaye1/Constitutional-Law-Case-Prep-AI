@@ -1,4 +1,6 @@
-from app.rag.store import is_instant_case_source
+from langchain_core.documents import Document
+
+from app.rag.store import docs_for_instant_case, is_instant_case_source
 
 
 def test_is_instant_case_source():
@@ -11,39 +13,44 @@ def test_is_instant_case_source():
     assert not is_instant_case_source("California v. Ciraolo (Oyez summary)")
 
 
-def test_docs_for_instant_case_ranks_by_query_not_early_page(monkeypatch):
-    """Regression: early-page bias returned only the caption for appellate asks."""
-    from langchain_core.documents import Document
-
+def test_docs_for_instant_case_prefers_doctrine_pages_over_caption():
+    """Caption pages must not crowd out Article II / Youngstown reasoning."""
     from app.rag import store as store_mod
 
     caption = Document(
-        page_content="IN THE UNITED STATES COURT OF APPEALS FOR THE FOURTEENTH CIRCUIT caption only",
-        metadata={"source": "ACFrOgRecord.pdf", "page": 1},
+        page_content="IN THE UNITED STATES COURT OF APPEALS FOR THE FOURTEENTH CIRCUIT Bobby Bronner caption only",
+        metadata={"source": "Instant Case [Bronner v. USA] — ACFrOg.pdf", "page": 1},
     )
     reasoning = Document(
         page_content=(
-            "We disagree. Because the president acted within his Article II authority "
-            "under Youngstown Category One and the AUMF, the appellate court reversed."
+            "IV Article II Analysis. We disagree. Because the president acted within his "
+            "Article II authority under Youngstown Category One and the AUMF and NDAA, "
+            "the government arguments on detention authority are affirmed."
         ),
-        metadata={"source": "ACFrOgRecord.pdf", "page": 12},
+        metadata={"source": "Instant Case [Bronner v. USA] — ACFrOg.pdf", "page": 12},
     )
 
     class FakeStore:
         def similarity_search_with_score(self, query, k=10):
-            # Hamdi-ish neighbor scores better on raw distance; Instant Case
-            # reasoning must still win after the Instant Case filter.
             other = Document(
                 page_content="Curtiss-Wright foreign affairs argument",
                 metadata={"source": "United States v. Curtiss-Wright.pdf", "page": 5},
             )
-            return [(other, 0.1), (caption, 0.4), (reasoning, 0.35)]
+            # Caption looks closer in embedding space; lexical path must still win.
+            return [(other, 0.1), (caption, 0.2), (reasoning, 0.55)]
 
-    hits = store_mod.docs_for_instant_case(
-        FakeStore(),
-        "Appellate Court reasoning president within authority Youngstown",
-        limit=2,
-    )
+    # Patch document scan used by lexical ranking.
+    original = store_mod._all_documents
+    store_mod._all_documents = lambda _store: [caption, reasoning]
+    try:
+        hits = docs_for_instant_case(
+            FakeStore(),
+            "Appellate Court reasoning president within authority Youngstown Article II",
+            limit=2,
+        )
+    finally:
+        store_mod._all_documents = original
+
     assert hits
-    assert "We disagree" in hits[0][0].page_content
     assert hits[0][0].metadata["page"] == 12
+    assert "Article II" in hits[0][0].page_content

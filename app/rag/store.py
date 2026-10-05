@@ -190,23 +190,75 @@ def docs_for_instant_case(
     store: FAISS,
     query: str = "",
     *,
-    limit: int = 8,
+    limit: int = 10,
 ) -> list[tuple[Document, float]]:
     """
-    Pull Instant Case / Bronner record chunks ranked by the question.
+    Pull Instant Case / Bronner record chunks ranked for the question.
 
-    Do not prefer early PDF pages — that used to return only the caption while
-    Instant Case questions about appellate reasoning live later in the record.
+    Mix vector hits with lexical ranking over *all* Instant Case chunks.
+    Caption pages 1–2 often win pure embedding similarity on “Bronner /
+    Court of Appeals,” while Article II / Youngstown reasoning lives later.
     """
     if store is None:
         return []
 
+    import re
+
     q = (query or "").strip()
+    query_tokens = {t for t in re.findall(r"[a-z0-9]+", q.lower()) if len(t) > 3}
+    # Doctrine / posture terms that live in the opinion body, not the caption.
+    boost_terms = {
+        "article",
+        "youngstown",
+        "aumf",
+        "ndaa",
+        "ata",
+        "appellate",
+        "disagree",
+        "authority",
+        "government",
+        "detention",
+        "fourth",
+        "president",
+        "congress",
+        "argument",
+        "reasoning",
+        "inherent",
+        "category",
+        "due",
+        "process",
+        "curtiss",
+        "jackson",
+    }
+    terms = query_tokens | boost_terms
+
+    instant_docs: list[Document] = []
+    for doc in _all_documents(store):
+        source = str((doc.metadata or {}).get("source") or "")
+        if is_instant_case_source(source) and (doc.page_content or "").strip():
+            instant_docs.append(doc)
+    if not instant_docs:
+        return []
+
+    # Lexical score every Instant Case chunk (lower distance = better).
+    lexical: list[tuple[Document, float, int]] = []
+    for doc in instant_docs:
+        text = (doc.page_content or "").lower()
+        hits = sum(1 for t in terms if t in text)
+        page = (doc.metadata or {}).get("page")
+        try:
+            page_n = int(page) if page is not None else 99
+        except (TypeError, ValueError):
+            page_n = 99
+        # Prefer opinion body over cover when scores tie.
+        distance = (1.0 / (1.0 + hits)) + (0.0005 * page_n if hits < 3 else 0.0)
+        lexical.append((doc, distance, hits))
+    lexical.sort(key=lambda item: (item[1], item[2] * -1))
+
+    # Vector hits filtered to Instant Case (when query present).
+    vector: list[tuple[Document, float]] = []
     if q:
-        # Over-fetch, then keep Instant Case hits so Hamdi/etc. cannot crowd out
-        # the record when the question is about Bronner.
         pairs = store.similarity_search_with_score(q, k=max(48, limit * 6))
-        filtered: list[tuple[Document, float]] = []
         seen: set[str] = set()
         for doc, score in pairs:
             meta = doc.metadata or {}
@@ -214,36 +266,44 @@ def docs_for_instant_case(
             if not is_instant_case_source(source):
                 continue
             text = (doc.page_content or "").strip()
-            key = f"{source}|{meta.get('page')}|{text[:120]}"
+            key = f"{source}|{meta.get('page')}|{text[:100]}"
             if not text or key in seen:
                 continue
             seen.add(key)
-            filtered.append((doc, float(score) if score is not None else 1.0))
-        if filtered:
-            # FAISS L2: lower distance is better. Re-sort after filtering.
-            filtered.sort(key=lambda item: item[1])
-            return filtered[:limit]
+            vector.append((doc, float(score) if score is not None else 1.0))
+        vector.sort(key=lambda item: item[1])
 
-    # Keyword fallback when vector search returns no Instant Case rows.
-    import re
+    # Merge: take strong lexical hits first (hits >= 3), then vector, then rest.
+    merged: list[tuple[Document, float]] = []
+    seen_keys: set[str] = set()
 
-    tokens = {t for t in re.findall(r"[a-z0-9]+", q.lower()) if len(t) > 3}
-    scored: list[tuple[Document, float]] = []
-    for doc in _all_documents(store):
+    def _key(doc: Document) -> str:
         meta = doc.metadata or {}
-        source = str(meta.get("source") or "")
-        if not is_instant_case_source(source):
-            continue
-        text = (doc.page_content or "").strip()
-        if not text:
-            continue
-        lower = text.lower()
-        hits = sum(1 for t in tokens if t in lower) if tokens else 0
-        # Lower is better (same convention as FAISS L2 distance).
-        distance = 1.0 / (1.0 + hits) if tokens else 0.5
-        scored.append((doc, distance))
-    scored.sort(key=lambda item: (item[1], str((item[0].metadata or {}).get("page") or "")))
-    return scored[:limit]
+        return f"{meta.get('source')}|{meta.get('page')}|{(doc.page_content or '')[:100]}"
+
+    def _add(doc: Document, score: float) -> None:
+        key = _key(doc)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        merged.append((doc, score))
+
+    for doc, distance, hits in lexical:
+        if hits >= 3:
+            _add(doc, distance)
+        if len(merged) >= max(6, limit // 2 + 2):
+            break
+    for doc, score in vector:
+        _add(doc, score)
+        if len(merged) >= limit:
+            break
+    if len(merged) < limit:
+        for doc, distance, _hits in lexical:
+            _add(doc, distance)
+            if len(merged) >= limit:
+                break
+
+    return merged[:limit]
 
 
 def remove_source_from_index(source: str) -> int:

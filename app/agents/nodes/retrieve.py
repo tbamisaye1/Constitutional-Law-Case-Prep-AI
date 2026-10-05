@@ -199,7 +199,7 @@ def retrieve_node(state: PrepState) -> dict:
     # pages 1–2). Early-page bias previously made every Bronner ask look empty.
     instant_hits = 0
     if mentions_instant_case(query) or mentions_instant_case(message):
-        for doc, score in docs_for_instant_case(store, query, limit=8):
+        for doc, score in docs_for_instant_case(store, query, limit=10):
             meta = doc.metadata or {}
             before = len(evidence)
             _append_hit(
@@ -220,10 +220,14 @@ def retrieve_node(state: PrepState) -> dict:
     # Keep Instant Case / record passages when present.
     record = [e for e in corpus if e.get("source_type") == "record"]
     other = [e for e in corpus if e.get("source_type") != "record"]
-    keep_local = local[:4]
-    # Instant Case hard questions need more record room than library neighbors.
-    keep_record = record[:7] if instant_hits else record[:3]
-    keep_other = other[: max(0, 12 - len(keep_local) - len(keep_record))]
+    keep_local = local[:3]
+    # Instant Case hard questions need record room; do not let Youngstown crowd them out.
+    if instant_hits:
+        keep_record = record[:9]
+        keep_other = other[:2]
+    else:
+        keep_record = record[:3]
+        keep_other = other[: max(0, 10 - len(keep_local) - len(keep_record))]
     evidence = keep_local + keep_record + keep_other
     for i, hit in enumerate(evidence):
         hit["id"] = f"ev-{i}"
