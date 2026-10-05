@@ -66,29 +66,51 @@ def _reason_documents(state: PrepState) -> dict:
             "grounding_notes": reason,
         }
 
-    if not get_settings().openrouter_api_key:
+    s = get_settings()
+    tier = normalize_model_tier(state.get("model_tier"))
+    has_key = bool(
+        (tier == "advanced" and s.openai_api_key.strip()) or s.openrouter_api_key.strip()
+    )
+    if not has_key:
         msg = make_abstain_message(
-            "Evidence was retrieved, but OPENROUTER_API_KEY is missing so we will not call a model."
+            "Evidence was retrieved, but no chat API key is configured "
+            "(need OPENAI_API_KEY for Advanced, or OPENROUTER_API_KEY)."
         )
         return {
             "messages": [AIMessage(content=msg)],
             "grounding_status": "abstained",
             "claims": [],
-            "grounding_notes": "Missing OpenRouter API key.",
+            "grounding_notes": "Missing chat API key.",
         }
 
     question = _latest_user_text(state)
     history = list(state.get("chat_history") or [])
     payload = build_reason_user_payload(question, _format_evidence(evidence), history)
-    tier = normalize_model_tier(state.get("model_tier"))
     model_id = resolve_chat_model_id(tier)
     model = get_chat_model(tier)
-    response = model.invoke(
-        [
-            SystemMessage(content=GROUNDED_LEGAL_SYSTEM),
-            HumanMessage(content=payload),
-        ]
-    )
+    try:
+        response = model.invoke(
+            [
+                SystemMessage(content=GROUNDED_LEGAL_SYSTEM),
+                HumanMessage(content=payload),
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001 — surface as abstain, not a bare 500
+        detail = str(exc)
+        hint = (
+            "Advanced model call failed. Turn Advanced responses off and retry, "
+            "or check OpenAI / OpenRouter credits for this model."
+            if tier == "advanced"
+            else "Chat model call failed. Retry in a moment, or check OpenRouter credits."
+        )
+        text = make_abstain_message(f"{hint}\n\n({detail[:400]})")
+        return {
+            "messages": [AIMessage(content=text)],
+            "grounding_status": "abstained",
+            "claims": [],
+            "grounding_notes": f"Model error ({model_id}/{tier}): {detail[:240]}",
+        }
+
     notes = f"Model: {model_id} ({tier})."
     return {
         "messages": [response],
