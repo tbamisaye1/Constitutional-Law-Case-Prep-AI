@@ -79,7 +79,27 @@ def _all_documents(store: FAISS) -> list[Document]:
 
 
 def _source_kind(source: str) -> str:
-    return "bootstrap" if source.endswith("(Oyez summary)") else "upload"
+    if source.endswith("(Oyez summary)"):
+        return "bootstrap"
+    if is_instant_case_source(source):
+        return "instant_case"
+    return "upload"
+
+
+def is_instant_case_source(source: str) -> bool:
+    """True for Instant Case / Bronner record PDFs in the FAISS index."""
+    name = (source or "").strip().lower()
+    if not name or name.endswith("(oyez summary)"):
+        return False
+    if "instant case" in name or "joint appendix" in name:
+        return True
+    if "bronner" in name and "hamdi" not in name:
+        return True
+    # Classroom / Drive exports of the record often land as ACFrOg….pdf
+    base = Path(name).name
+    if base.startswith("acfrog"):
+        return True
+    return False
 
 
 def list_index_sources() -> list[dict]:
@@ -118,6 +138,11 @@ def _source_matches(metadata_source: str, target: str) -> bool:
     target_base = Path(target).name.lower()
     if meta_base and target_base and meta_base == target_base:
         return True
+    # Instant Case label: "Instant Case [Bronner v. USA] — file.pdf"
+    if " — " in metadata_source:
+        suffix = metadata_source.split(" — ", 1)[-1].strip().lower()
+        if suffix and (suffix == target_base or suffix == target.lower()):
+            return True
     return False
 
 
@@ -157,6 +182,35 @@ def docs_for_source(
             distance = 0.01 + (0.02 * delta)
         scored.append((doc, distance))
 
+    scored.sort(key=lambda item: (item[1], str((item[0].metadata or {}).get("page") or "")))
+    return scored[:limit]
+
+
+def docs_for_instant_case(
+    store: FAISS,
+    *,
+    limit: int = 6,
+) -> list[tuple[Document, float]]:
+    """
+    Pull Instant Case / Bronner record chunks so Uploaded docs mode does not
+    answer Instant Case questions only from Hamdi / library neighbors.
+    """
+    if store is None:
+        return []
+    scored: list[tuple[Document, float]] = []
+    for doc in _all_documents(store):
+        meta = doc.metadata or {}
+        source = str(meta.get("source") or "")
+        if not is_instant_case_source(source):
+            continue
+        page = meta.get("page")
+        # Prefer early record pages (facts / proceedings) slightly.
+        try:
+            page_n = int(page) if page is not None else 50
+        except (TypeError, ValueError):
+            page_n = 50
+        distance = 0.04 + min(page_n, 40) * 0.001
+        scored.append((doc, distance))
     scored.sort(key=lambda item: (item[1], str((item[0].metadata or {}).get("page") or "")))
     return scored[:limit]
 

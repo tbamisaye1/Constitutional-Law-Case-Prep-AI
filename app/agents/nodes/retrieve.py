@@ -16,14 +16,17 @@ from app.grounding.selection import (
     extract_selection,
     extract_source_file,
     extract_source_page,
+    mentions_instant_case,
     retrieval_query,
 )
-from app.rag.store import docs_for_source, load_store
+from app.rag.store import docs_for_instant_case, docs_for_source, is_instant_case_source, load_store
 
 
 def _guess_source_type(source: str) -> SourceType:
     name = source.lower()
-    if "record" in name or name.startswith("r.") or "bronner" in name and "guide" not in name:
+    if is_instant_case_source(source):
+        return "record"
+    if "record" in name or name.startswith("r."):
         return "record"
     if "note" in name or source.startswith("(selected"):
         return "user_note"
@@ -177,7 +180,9 @@ def retrieve_node(state: PrepState) -> dict:
 
     # similarity_search_with_score returns (Document, score). Lower distance
     # is better for L2; we keep the raw score for abstain heuristics.
-    pairs = store.similarity_search_with_score(query, k=6)
+    # Uploaded docs mode searches the whole index (Instant Case + Case library
+    # + Articles), not an Articles-only shelf.
+    pairs = store.similarity_search_with_score(query, k=8)
     for doc, score in pairs:
         meta = doc.metadata or {}
         source = str(meta.get("source", "unknown"))
@@ -190,17 +195,42 @@ def retrieve_node(state: PrepState) -> dict:
             score=float(score) if score is not None else None,
         )
 
+    # Instant Case questions: force record PDF chunks in even if Hamdi/etc.
+    # ranked higher on raw embedding distance.
+    instant_hits = 0
+    if mentions_instant_case(query) or mentions_instant_case(message):
+        for doc, score in docs_for_instant_case(store, limit=5):
+            meta = doc.metadata or {}
+            before = len(evidence)
+            _append_hit(
+                evidence,
+                text=doc.page_content or "",
+                source=str(meta.get("source", "Instant Case")),
+                page=meta.get("page"),
+                source_type="record",
+                score=score,
+            )
+            if len(evidence) > before:
+                instant_hits += 1
+
     # Cap so the reason prompt stays readable. Prefer local notes + selection.
     local_types = ("notebook", "user_note", "annotation")
     local = [e for e in evidence if e.get("source_type") in local_types]
     corpus = [e for e in evidence if e.get("source_type") not in local_types]
-    keep_local = local[:6]
-    keep_corpus = corpus[: max(0, 10 - len(keep_local))]
-    evidence = keep_local + keep_corpus
+    # Keep Instant Case / record passages when present.
+    record = [e for e in corpus if e.get("source_type") == "record"]
+    other = [e for e in corpus if e.get("source_type") != "record"]
+    keep_local = local[:5]
+    keep_record = record[:4]
+    keep_other = other[: max(0, 10 - len(keep_local) - len(keep_record))]
+    evidence = keep_local + keep_record + keep_other
     for i, hit in enumerate(evidence):
         hit["id"] = f"ev-{i}"
 
-    notes = f"Retrieved {len(evidence)} passage(s)."
+    notes = (
+        f"Retrieved {len(evidence)} passage(s) from all uploaded PDFs "
+        "(Instant Case, Case library, and Articles)."
+    )
     if notes_added:
         notes += f" Included {notes_added} local note/annotation chunk(s) from this browser."
     if selection:
@@ -210,6 +240,8 @@ def retrieve_node(state: PrepState) -> dict:
         if source_page is not None:
             notes += f" p.{source_page}"
         notes += f" ({same_source_hits} nearby chunk(s))."
+    if instant_hits:
+        notes += f" Added {instant_hits} Instant Case / record chunk(s)."
 
     return {
         "evidence": evidence,
