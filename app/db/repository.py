@@ -15,8 +15,11 @@ at once, which is why nothing here pretends to merge text.
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Sequence
 
 from psycopg.types.json import Jsonb
@@ -48,6 +51,14 @@ _RICH_TEXT_FIELDS = ("bodyHtml", "notes", "summary", "text", "holding", "rule")
 _AUTO_BACKUP_MIN_INTERVAL_SECONDS = 60 * 60  # one auto snapshot per hour
 _AUTO_BACKUP_KEEP = 200  # ~8 days of hourly + headroom
 _MANUAL_BACKUP_KEEP = 100
+
+# Category 3 ladder seed fingerprints (generated from the frontend seed file).
+# A sync push that re-uploads seed text must not erase manual argument notes.
+_CATEGORY3_SEED_PATH = Path(__file__).with_name("category3_ladder_seed.json")
+try:
+    _CATEGORY3_SEED = json.loads(_CATEGORY3_SEED_PATH.read_text(encoding="utf-8"))
+except Exception:  # pragma: no cover - missing file should not break sync
+    _CATEGORY3_SEED = {"sections": {}}
 
 
 @dataclass(frozen=True)
@@ -444,6 +455,9 @@ def push_changes(
                 prepared = _protect_notebook_from_smaller_push(
                     cursor, workspace_id, prepared
                 )
+                prepared = _protect_arguments_from_seed_or_thinner_push(
+                    cursor, workspace_id, prepared
+                )
                 prepared = _protect_rich_library_text_from_thinner_push(
                     cursor, workspace_id, prepared
                 )
@@ -492,6 +506,200 @@ def _protect_notebook_from_smaller_push(
         if not existing or not isinstance(existing.get("data"), dict):
             return prepared
         merged = merge_notebook_snapshots(incoming, existing["data"])
+        if merged != incoming:
+            return {**prepared, "data": merged}
+    except Exception:
+        return prepared
+    return prepared
+
+
+def _norm_html(text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _seed_prong_notes(prong_id: str) -> str:
+    for section in (_CATEGORY3_SEED.get("sections") or {}).values():
+        prongs = section.get("prongs") or {}
+        if prong_id in prongs:
+            return str(prongs[prong_id].get("notes") or "")
+    return ""
+
+
+def _seed_prong_title(prong_id: str) -> str:
+    for section in (_CATEGORY3_SEED.get("sections") or {}).values():
+        prongs = section.get("prongs") or {}
+        if prong_id in prongs:
+            return str(prongs[prong_id].get("title") or "").strip()
+    return ""
+
+
+def _looks_like_seed_notes(prong_id: str, notes: str) -> bool:
+    seed = _seed_prong_notes(prong_id)
+    if not seed or not notes:
+        return False
+    norm = _norm_html(notes)
+    seed_norm = _norm_html(seed)
+    if not seed_norm or not norm:
+        return False
+    if norm == seed_norm or norm.startswith(seed_norm[:80]):
+        return True
+    # Seed rewrite often keeps the first <h2>; treat that heading as a fingerprint.
+    match = re.search(r"<h2[^>]*>(.*?)</h2>", seed, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return False
+    heading = _norm_html(match.group(1))
+    return bool(heading) and len(heading) >= 12 and heading in norm
+
+
+def _pick_argument_notes(server_notes: str, incoming_notes: str, prong_id: str) -> str:
+    server = server_notes if isinstance(server_notes, str) else ""
+    incoming = incoming_notes if isinstance(incoming_notes, str) else ""
+    if not server.strip():
+        return incoming
+    if not incoming.strip():
+        return server
+    if server == incoming:
+        return incoming
+    server_seed = _looks_like_seed_notes(prong_id, server)
+    incoming_seed = _looks_like_seed_notes(prong_id, incoming)
+    # Seed must never replace a divergent manual edit, even if seed is longer.
+    if incoming_seed and not server_seed:
+        return server
+    if server_seed and not incoming_seed:
+        return incoming
+    return server if len(server) >= len(incoming) else incoming
+
+
+def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) -> str:
+    server = server_title.strip() if isinstance(server_title, str) else ""
+    incoming = incoming_title.strip() if isinstance(incoming_title, str) else ""
+    if not server:
+        return incoming_title if isinstance(incoming_title, str) else incoming
+    if not incoming:
+        return server_title if isinstance(server_title, str) else server
+    if server == incoming:
+        return incoming_title if isinstance(incoming_title, str) else incoming
+    seed_title = _seed_prong_title(prong_id)
+    if seed_title:
+        if incoming == seed_title and server != seed_title:
+            return server_title if isinstance(server_title, str) else server
+        if server == seed_title and incoming != seed_title:
+            return incoming_title if isinstance(incoming_title, str) else incoming
+    return (
+        (server_title if isinstance(server_title, str) else server)
+        if len(server) >= len(incoming)
+        else (incoming_title if isinstance(incoming_title, str) else incoming)
+    )
+
+
+def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) -> dict[str, Any]:
+    """
+    Keep manual prong notes/titles when an incoming sync would re-apply seed.
+    Outline deletions on the incoming board still win (missing prong ids stay gone).
+    """
+    incoming_sides = incoming.get("draftsBySide")
+    server_sides = server.get("draftsBySide")
+    if not isinstance(incoming_sides, dict) or not isinstance(server_sides, dict):
+        return incoming
+
+    merged_sides: dict[str, Any] = {}
+    changed = False
+    for side, incoming_drafts in incoming_sides.items():
+        if not isinstance(incoming_drafts, list):
+            merged_sides[side] = incoming_drafts
+            continue
+        server_drafts = server_sides.get(side) if isinstance(server_sides.get(side), list) else []
+        server_by_id = {
+            d.get("id"): d for d in server_drafts if isinstance(d, dict) and d.get("id")
+        }
+        next_drafts = []
+        for draft in incoming_drafts:
+            if not isinstance(draft, dict):
+                next_drafts.append(draft)
+                continue
+            server_draft = server_by_id.get(draft.get("id"))
+            if not isinstance(server_draft, dict):
+                next_drafts.append(draft)
+                continue
+            server_sections = {
+                s.get("id"): s
+                for s in (server_draft.get("sections") or [])
+                if isinstance(s, dict) and s.get("id")
+            }
+            next_sections = []
+            for section in draft.get("sections") or []:
+                if not isinstance(section, dict):
+                    next_sections.append(section)
+                    continue
+                server_section = server_sections.get(section.get("id"))
+                if not isinstance(server_section, dict):
+                    next_sections.append(section)
+                    continue
+                server_prongs = {
+                    p.get("id"): p
+                    for p in (server_section.get("prongs") or [])
+                    if isinstance(p, dict) and p.get("id")
+                }
+                next_prongs = []
+                for prong in section.get("prongs") or []:
+                    if not isinstance(prong, dict):
+                        next_prongs.append(prong)
+                        continue
+                    server_prong = server_prongs.get(prong.get("id"))
+                    if not isinstance(server_prong, dict):
+                        next_prongs.append(prong)
+                        continue
+                    prong_id = str(prong.get("id"))
+                    notes = _pick_argument_notes(
+                        str(server_prong.get("notes") or ""),
+                        str(prong.get("notes") or ""),
+                        prong_id,
+                    )
+                    title = _pick_argument_title(
+                        str(server_prong.get("title") or ""),
+                        str(prong.get("title") or ""),
+                        prong_id,
+                    )
+                    if notes != prong.get("notes") or title != prong.get("title"):
+                        changed = True
+                    next_prongs.append({**prong, "notes": notes, "title": title})
+                next_sections.append({**section, "prongs": next_prongs})
+            next_drafts.append({**draft, "sections": next_sections})
+        merged_sides[side] = next_drafts
+
+    if not changed:
+        return incoming
+    return {**incoming, "draftsBySide": merged_sides}
+
+
+def _protect_arguments_from_seed_or_thinner_push(
+    cursor,
+    workspace_id: str,
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Block Category 3 seed (or thinner) argument pushes from erasing manual notes.
+    """
+    if prepared.get("kind") != "arguments":
+        return prepared
+    incoming = prepared.get("data")
+    if not isinstance(incoming, dict):
+        return prepared
+    try:
+        cursor.execute(
+            """
+            SELECT data
+            FROM library_records
+            WHERE workspace_id = %s AND kind = 'arguments' AND id = %s
+              AND deleted_at IS NULL
+            """,
+            (workspace_id, prepared.get("id")),
+        )
+        existing = cursor.fetchone()
+        if not existing or not isinstance(existing.get("data"), dict):
+            return prepared
+        merged = _merge_arguments_boards(incoming, existing["data"])
         if merged != incoming:
             return {**prepared, "data": merged}
     except Exception:
