@@ -1,9 +1,13 @@
+from datetime import datetime, timezone
+
 from app.db.repository import (
     _looks_like_seed_draft_notes,
     _merge_arguments_boards,
     _pick_argument_notes,
     _pick_rich_notes,
     _protect_arguments_from_seed_or_thinner_push,
+    _protect_arguments_stale_base,
+    to_epoch_ms,
 )
 
 
@@ -330,3 +334,64 @@ def test_merge_rejects_ai_jackson_title_and_claim_notes():
     assert "Youngstown" in prong["title"]
     assert "Jackson's test" in prong["notes"]
     assert "claim in one sentence" not in prong["notes"].lower()
+
+
+def test_stale_base_rejects_differing_push_without_matching_base():
+    server_at = datetime(2026, 10, 6, 18, 46, 56, tzinfo=timezone.utc)
+    existing = {
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>mcp edit</p>"}]}},
+        "updated_at": server_at,
+    }
+    prepared = {
+        "kind": "arguments",
+        "id": "main",
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>stale tab</p>"}]}},
+        "updatedAt": to_epoch_ms(server_at) + 2000,
+        # Missing baseUpdatedAt: old client / dirty stamp race.
+    }
+    out, reason, server_row = _protect_arguments_stale_base(
+        _Cursor(existing), "ws", prepared
+    )
+    assert reason == "arguments_rejected_missing_base"
+    assert server_row["data"]["draftsBySide"]["petitioner"][0]["notes"] == "<p>mcp edit</p>"
+    assert server_row["serverUpdatedAt"] == to_epoch_ms(server_at)
+    assert out is prepared
+
+
+def test_stale_base_allows_push_when_base_matches():
+    server_at = datetime(2026, 10, 6, 18, 46, 56, tzinfo=timezone.utc)
+    existing = {
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>server</p>"}]}},
+        "updated_at": server_at,
+    }
+    prepared = {
+        "kind": "arguments",
+        "id": "main",
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>real edit</p>"}]}},
+        "updatedAt": to_epoch_ms(server_at) + 5000,
+        "baseUpdatedAt": to_epoch_ms(server_at),
+    }
+    out, reason, server_row = _protect_arguments_stale_base(
+        _Cursor(existing), "ws", prepared
+    )
+    assert reason is None
+    assert server_row is None
+    assert out["data"]["draftsBySide"]["petitioner"][0]["notes"] == "<p>real edit</p>"
+
+
+def test_stale_base_identical_content_skips_check():
+    server_at = datetime(2026, 10, 6, 18, 46, 56, tzinfo=timezone.utc)
+    board = {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>same</p>"}]}}
+    existing = {"data": board, "updated_at": server_at}
+    prepared = {
+        "kind": "arguments",
+        "id": "main",
+        "data": board,
+        "updatedAt": to_epoch_ms(server_at) + 9000,
+    }
+    out, reason, server_row = _protect_arguments_stale_base(
+        _Cursor(existing), "ws", prepared
+    )
+    assert reason is None
+    assert server_row is None
+    assert out is prepared

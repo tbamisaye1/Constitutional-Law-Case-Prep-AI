@@ -514,9 +514,29 @@ def push_changes(
         for row in rows[:MAX_ROWS_PER_ENTITY]:
             prepared = _with_push_defaults(spec, row)
             reject_reason: str | None = None
+            reject_server_row: dict[str, Any] | None = None
             if name == "library_records":
                 if prepared.get("kind") in _BACKUP_TRIGGER_KINDS:
                     touched_backup_kinds = True
+                prepared, reject_reason, reject_server_row = (
+                    _protect_arguments_stale_base(cursor, workspace_id, prepared)
+                )
+                if reject_reason:
+                    # Stale / missing base: keep the live row untouched. Writing
+                    # would bump updated_at and thrash every other client.
+                    entry: dict[str, Any] = {
+                        "collection": name,
+                        "kind": prepared.get("kind"),
+                        "id": prepared.get("id"),
+                        "reason": reject_reason,
+                    }
+                    if reject_server_row is not None:
+                        entry["data"] = reject_server_row.get("data")
+                        entry["serverUpdatedAt"] = reject_server_row.get(
+                            "serverUpdatedAt"
+                        )
+                    rejected.append(entry)
+                    continue
                 prepared = _protect_notebook_from_smaller_push(
                     cursor, workspace_id, prepared
                 )
@@ -1102,6 +1122,60 @@ def _c3_s1_a_title(board: dict[str, Any]) -> str:
     except Exception:
         return ""
     return ""
+
+
+def _protect_arguments_stale_base(
+    cursor,
+    workspace_id: str,
+    prepared: dict[str, Any],
+) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
+    """
+    Reject Arguments pushes that did not start from the live server version.
+
+    A dirty browser tab stamps Date.now() on every edit (or false dirty), so
+    last-write-wins treats stale content as newer than an MCP / other-device
+    write from a second earlier. Clients must send baseUpdatedAt equal to the
+    server updated_at they last loaded; differing content without that match
+    is refused and the live row is left alone.
+
+    Returns (prepared, reason, server_row_or_none). server_row carries data +
+    serverUpdatedAt so the client can drop its dirty board without a write.
+    """
+    if prepared.get("kind") != "arguments" or prepared.get("deleted"):
+        return prepared, None, None
+    incoming = prepared.get("data")
+    if not isinstance(incoming, dict):
+        return prepared, None, None
+    try:
+        cursor.execute(
+            """
+            SELECT data, updated_at
+            FROM library_records
+            WHERE workspace_id = %s AND kind = 'arguments' AND id = %s
+              AND deleted_at IS NULL
+            """,
+            (workspace_id, prepared.get("id")),
+        )
+        existing = cursor.fetchone()
+        if not existing or not isinstance(existing.get("data"), dict):
+            return prepared, None, None
+        server = existing["data"]
+        if incoming == server:
+            return prepared, None, None
+        server_ms = to_epoch_ms(existing["updated_at"])
+        server_row = {"data": server, "serverUpdatedAt": server_ms}
+        base = prepared.get("baseUpdatedAt")
+        if base is None:
+            return prepared, "arguments_rejected_missing_base", server_row
+        try:
+            base_ms = int(base)
+        except (TypeError, ValueError):
+            base_ms = -1
+        if base_ms != int(server_ms):
+            return prepared, "arguments_rejected_stale_base", server_row
+    except Exception:
+        return prepared, None, None
+    return prepared, None, None
 
 
 def _protect_arguments_from_seed_or_thinner_push(
