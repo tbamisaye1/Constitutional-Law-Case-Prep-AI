@@ -152,3 +152,82 @@ def test_workspace_matter_overrides_the_seed(client, workspace_id):
     titles = {matter["id"]: matter["title"] for matter in body["matters"]}
 
     assert titles["bronner-2026"] == "Bronner, my edit"
+
+
+@requires_database
+def test_identical_arguments_push_does_not_bump_updated_at(client, workspace_id):
+    """
+    Idle tabs re-pushing the same Arguments board must not win version races.
+
+    A no-op content push used to upsert with a newer updated_at every few
+    seconds, so MCP / other-device edits always conflicted.
+    """
+    board = {
+        "id": "main",
+        "draftsBySide": {
+            "petitioner": [
+                {
+                    "id": "petitioner-main",
+                    "name": "Main",
+                    "notes": "<p>2nd Ebb considerations:</p>",
+                    "sections": [],
+                }
+            ],
+            "respondent": [],
+        },
+    }
+    first = client.post(
+        "/sync",
+        headers={WORKSPACE_HEADER: workspace_id},
+        json={
+            "since": 0,
+            "changes": {
+                "library_records": [
+                    {
+                        "kind": "arguments",
+                        "id": "main",
+                        "data": board,
+                        "updatedAt": 5_000,
+                    }
+                ]
+            },
+        },
+    ).json()
+    assert first["written"]["library_records"] == 1
+    first_row = next(
+        row
+        for row in first["changes"]["library_records"]
+        if row["kind"] == "arguments" and row["id"] == "main"
+    )
+    first_updated = first_row["updatedAt"]
+
+    second = client.post(
+        "/sync",
+        headers={WORKSPACE_HEADER: workspace_id},
+        json={
+            "since": first["serverTime"],
+            "changes": {
+                "library_records": [
+                    {
+                        "kind": "arguments",
+                        "id": "main",
+                        "data": board,
+                        "updatedAt": first_updated + 60_000,
+                    }
+                ]
+            },
+        },
+    ).json()
+    assert second["written"].get("library_records", 0) == 0
+
+    pull = client.post(
+        "/sync",
+        headers={WORKSPACE_HEADER: workspace_id},
+        json={"since": 0, "changes": {}},
+    ).json()
+    live = next(
+        row
+        for row in pull["changes"]["library_records"]
+        if row["kind"] == "arguments" and row["id"] == "main"
+    )
+    assert live["updatedAt"] == first_updated

@@ -342,6 +342,41 @@ def _push_values(
 _LIBRARY_REVISION_KEEP = 120
 
 
+def _library_record_payload_unchanged(
+    cursor,
+    workspace_id: str,
+    prepared: dict[str, Any],
+) -> bool:
+    """
+    True when the incoming library_records row would not change stored data.
+
+    Used to skip no-op upserts so updated_at stays put. Tombstones and missing
+    rows always return False so create / delete still run.
+    """
+    kind = prepared.get("kind")
+    record_id = prepared.get("id")
+    incoming = prepared.get("data")
+    if not isinstance(kind, str) or not isinstance(record_id, str):
+        return False
+    if prepared.get("deleted"):
+        return False
+    try:
+        cursor.execute(
+            """
+            SELECT data, deleted_at
+            FROM library_records
+            WHERE workspace_id = %s AND kind = %s AND id = %s
+            """,
+            (workspace_id, kind, record_id),
+        )
+        existing = cursor.fetchone()
+    except Exception:
+        return False
+    if not existing or existing.get("deleted_at") is not None:
+        return False
+    return existing.get("data") == incoming
+
+
 def _archive_library_record_before_overwrite(
     cursor,
     workspace_id: str,
@@ -503,6 +538,11 @@ def push_changes(
                             "reason": reject_reason,
                         }
                     )
+                elif _library_record_payload_unchanged(cursor, workspace_id, prepared):
+                    # Identical content must not bump updated_at. Idle Arguments
+                    # tabs were re-pushing the same board every few seconds and
+                    # winning the version race against MCP / other devices.
+                    continue
                 _archive_library_record_before_overwrite(
                     cursor, workspace_id, prepared, now
                 )
