@@ -23,8 +23,11 @@ from app.api.deps import WorkspaceSession, workspace_session
 from app.db.repository import (
     ENTITY_BY_NAME,
     MAX_ROWS_PER_ENTITY,
+    build_sync_audit_payload,
+    list_sync_audit,
     pull_changes,
     push_changes,
+    record_sync_audit,
     to_epoch_ms,
     workspace_counts,
 )
@@ -76,6 +79,22 @@ def pull(
     """Download everything in this workspace that changed after `since`."""
     now = datetime.now(timezone.utc)
     changes = pull_changes(session.cursor, session.workspace_id, since)
+    record_sync_audit(
+        session.cursor,
+        session.workspace_id,
+        {
+            "event": "pull_only",
+            "client_since_ms": since,
+            "inbound": {},
+            "written": {},
+            "row_summaries": [],
+            "arguments_snapshot": None,
+            "empty_push": True,
+            "arguments_unchanged": None,
+            "note": "pull_only",
+        },
+        now,
+    )
     return SyncResponse(serverTime=to_epoch_ms(now), changes=changes)
 
 
@@ -90,11 +109,25 @@ def push_then_pull(
     Rows the client just sent can come back in the response. That is harmless
     and deliberate: the client applies a pulled row only when its updatedAt is
     strictly newer than the local copy, so an echo is a no-op instead of a loop.
+
+    Every round-trip is also written to sync_audit_log (including empty
+    heartbeats) so a wall of 200 OK cannot hide a frozen Arguments board again.
     """
     _reject_oversized(body.changes)
 
     unknown = sorted(set(body.changes) - set(ENTITY_BY_NAME))
     now = datetime.now(timezone.utc)
+
+    # Compare inbound Arguments to the live server row BEFORE write, otherwise
+    # a successful push would always look "unchanged" after upsert.
+    audit = build_sync_audit_payload(
+        session.cursor,
+        session.workspace_id,
+        body.changes,
+        {},
+        client_since_ms=body.since,
+        event="push_then_pull",
+    )
 
     written = push_changes(session.cursor, session.workspace_id, body.changes, now)
     changes = pull_changes(session.cursor, session.workspace_id, body.since)
@@ -103,6 +136,13 @@ def push_then_pull(
         # Visible in the response rather than raising, so one unrecognised
         # collection never blocks a sync that is otherwise fine.
         written["ignored:" + ",".join(unknown)] = 0
+
+    audit["written"] = written
+    if written.get("library_records"):
+        bits = [p for p in (audit.get("note") or "").split(",") if p]
+        bits.append(f"wrote_library_records={written.get('library_records')}")
+        audit["note"] = ",".join(dict.fromkeys(bits))
+    record_sync_audit(session.cursor, session.workspace_id, audit, now)
 
     return SyncResponse(
         serverTime=to_epoch_ms(now),
@@ -118,4 +158,23 @@ def status(session: WorkspaceSession = Depends(workspace_session)) -> dict:
         "workspaceId": session.workspace_id,
         "counts": workspace_counts(session.cursor, session.workspace_id),
         "serverTime": to_epoch_ms(datetime.now(timezone.utc)),
+    }
+
+
+@router.get("/audit")
+def audit_log(
+    limit: int = Query(default=50, ge=1, le=200),
+    session: WorkspaceSession = Depends(workspace_session),
+) -> dict:
+    """
+    Recent sync forensic rows for this workspace (newest first).
+
+    Used when diagnosing heartbeats that returned 200 while Arguments
+    never moved on Postgres.
+    """
+    return {
+        "workspaceId": session.workspace_id,
+        "entries": list_sync_audit(
+            session.cursor, session.workspace_id, limit=limit
+        ),
     }

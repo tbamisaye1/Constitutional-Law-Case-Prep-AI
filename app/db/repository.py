@@ -15,6 +15,7 @@ at once, which is why nothing here pretends to merge text.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -489,6 +490,232 @@ def push_changes(
             maybe_auto_backup_workspace(cursor, workspace_id, now, reason="sync_push")
 
     return written
+
+
+_SYNC_AUDIT_KEEP = 500
+
+
+def _sha256_json(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _c3_s1_a_notes_from_board(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    try:
+        for draft in (data.get("draftsBySide") or {}).get("petitioner") or []:
+            if not isinstance(draft, dict):
+                continue
+            for section in draft.get("sections") or []:
+                if not isinstance(section, dict):
+                    continue
+                for prong in section.get("prongs") or []:
+                    if isinstance(prong, dict) and prong.get("id") == "c3-s1-a":
+                        return str(prong.get("notes") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def build_sync_audit_payload(
+    cursor,
+    workspace_id: str,
+    changes: dict[str, Sequence[dict]],
+    written: dict[str, int],
+    *,
+    client_since_ms: int | None,
+    event: str = "push_then_pull",
+) -> dict[str, Any]:
+    """
+    Summarise one /sync request for forensic storage.
+
+    Heartbeats (empty changes) are recorded too so a wall of 200 OK cannot hide
+    a frozen Arguments board again.
+    """
+    inbound: dict[str, int] = {}
+    summaries: list[dict[str, Any]] = []
+    arguments_snapshot: dict[str, Any] | None = None
+    arguments_unchanged: bool | None = None
+
+    for name, rows in (changes or {}).items():
+        if not rows:
+            continue
+        inbound[name] = len(rows)
+        for row in list(rows)[:MAX_ROWS_PER_ENTITY]:
+            if not isinstance(row, dict):
+                continue
+            summary: dict[str, Any] = {
+                "collection": name,
+                "id": row.get("id"),
+                "updatedAt": row.get("updatedAt"),
+                "deleted": bool(row.get("deleted")),
+            }
+            if name == "library_records":
+                kind = row.get("kind")
+                data = row.get("data")
+                summary["kind"] = kind
+                summary["bytes"] = len(
+                    json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+                ) if data is not None else 0
+                summary["sha256"] = _sha256_json(data) if data is not None else None
+                if kind == "arguments" and isinstance(data, dict):
+                    arguments_snapshot = data
+                    notes = _c3_s1_a_notes_from_board(data)
+                    summary["c3s1aNotesSha256"] = (
+                        hashlib.sha256(notes.encode("utf-8")).hexdigest() if notes else None
+                    )
+                    summary["c3s1aNotesBytes"] = len(notes.encode("utf-8")) if notes else 0
+                    draft0 = ""
+                    try:
+                        draft0 = str(
+                            (data.get("draftsBySide") or {})
+                            .get("petitioner", [{}])[0]
+                            .get("notes")
+                            or ""
+                        )[:120]
+                    except Exception:
+                        draft0 = ""
+                    summary["draftNotesPrefix"] = draft0
+                    # Compare to live server row so heartbeats that re-send the
+                    # same board are visible as arguments_unchanged=true.
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT data
+                            FROM library_records
+                            WHERE workspace_id = %s AND kind = 'arguments' AND id = %s
+                              AND deleted_at IS NULL
+                            """,
+                            (workspace_id, row.get("id") or "main"),
+                        )
+                        existing = cursor.fetchone()
+                        if existing and isinstance(existing.get("data"), dict):
+                            arguments_unchanged = existing["data"] == data
+                        else:
+                            arguments_unchanged = False
+                    except Exception:
+                        arguments_unchanged = None
+            else:
+                # Compact hash of the whole row without storing full annotation text.
+                summary["sha256"] = _sha256_json(row)
+            summaries.append(summary)
+
+    empty_push = not any(inbound.values())
+    note_bits = []
+    if empty_push:
+        note_bits.append("empty_inbound")
+    if arguments_unchanged is True:
+        note_bits.append("arguments_identical_to_server")
+    if arguments_unchanged is False and arguments_snapshot is not None:
+        note_bits.append("arguments_differs_from_server")
+    if written.get("library_records"):
+        note_bits.append(f"wrote_library_records={written.get('library_records')}")
+
+    return {
+        "event": event,
+        "client_since_ms": client_since_ms,
+        "inbound": inbound,
+        "written": written,
+        "row_summaries": summaries,
+        "arguments_snapshot": arguments_snapshot,
+        "empty_push": empty_push,
+        "arguments_unchanged": arguments_unchanged,
+        "note": ",".join(note_bits) if note_bits else None,
+    }
+
+
+def record_sync_audit(
+    cursor,
+    workspace_id: str,
+    audit: dict[str, Any],
+    now: datetime | None = None,
+) -> None:
+    """
+    Persist one sync forensic row. Never raises into the request path.
+    """
+    stamp = now or datetime.now(timezone.utc)
+    try:
+        cursor.execute(
+            """
+            INSERT INTO sync_audit_log (
+                workspace_id, created_at, event, client_since_ms,
+                inbound, written, row_summaries, arguments_snapshot,
+                empty_push, arguments_unchanged, note
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                workspace_id,
+                stamp,
+                str(audit.get("event") or "push_then_pull")[:80],
+                audit.get("client_since_ms"),
+                Jsonb(audit.get("inbound") or {}),
+                Jsonb(audit.get("written") or {}),
+                Jsonb(audit.get("row_summaries") or []),
+                Jsonb(audit["arguments_snapshot"])
+                if isinstance(audit.get("arguments_snapshot"), dict)
+                else None,
+                bool(audit.get("empty_push")),
+                audit.get("arguments_unchanged"),
+                (audit.get("note") or None),
+            ),
+        )
+        cursor.execute(
+            """
+            DELETE FROM sync_audit_log
+            WHERE id IN (
+                SELECT id FROM sync_audit_log
+                WHERE workspace_id = %s
+                ORDER BY created_at DESC
+                OFFSET %s
+            )
+            """,
+            (workspace_id, _SYNC_AUDIT_KEEP),
+        )
+    except Exception:
+        # Table may not exist until migrate runs; never block sync.
+        return
+
+
+def list_sync_audit(
+    cursor,
+    workspace_id: str,
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Recent sync forensic rows for this workspace (newest first)."""
+    limit = max(1, min(int(limit or 50), 200))
+    cursor.execute(
+        """
+        SELECT id, created_at, event, client_since_ms, inbound, written,
+               row_summaries, arguments_snapshot IS NOT NULL AS has_arguments_snapshot,
+               empty_push, arguments_unchanged, note
+        FROM sync_audit_log
+        WHERE workspace_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (workspace_id, limit),
+    )
+    rows = []
+    for row in cursor.fetchall():
+        rows.append(
+            {
+                "id": row["id"],
+                "createdAt": to_epoch_ms(row["created_at"]) if row["created_at"] else None,
+                "event": row["event"],
+                "clientSinceMs": row["client_since_ms"],
+                "inbound": row["inbound"] or {},
+                "written": row["written"] or {},
+                "rowSummaries": row["row_summaries"] or [],
+                "hasArgumentsSnapshot": bool(row["has_arguments_snapshot"]),
+                "emptyPush": bool(row["empty_push"]),
+                "argumentsUnchanged": row["arguments_unchanged"],
+                "note": row["note"],
+            }
+        )
+    return rows
 
 
 def _protect_notebook_from_smaller_push(
