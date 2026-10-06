@@ -347,17 +347,25 @@ def _archive_library_record_before_overwrite(
     workspace_id: str,
     row: dict[str, Any],
     now: datetime,
-) -> None:
+    *,
+    source: str = "sync_push",
+) -> int | None:
     """
     Copy the current library_records.data into history when a push would change it.
 
     Sync itself stays last-write-wins. This archive exists so a wiped arguments
     board (or notebook / guide edits) can be pulled back without Neon PITR.
+
+    Args:
+        source: Who triggered the overwrite (`sync_push`, `mcp`, `restore`, …).
+
+    Returns:
+        The new revision id when a row was archived, otherwise None.
     """
     kind = row.get("kind")
     record_id = row.get("id")
     if not isinstance(kind, str) or not isinstance(record_id, str):
-        return
+        return None
 
     try:
         cursor.execute(
@@ -370,14 +378,14 @@ def _archive_library_record_before_overwrite(
         )
         existing = cursor.fetchone()
         if not existing:
-            return
+            return None
 
         incoming = row.get("data")
         if incoming is None:
-            return
+            return None
         # Skip archive when the payload is identical; avoids noise on heartbeat syncs.
         if existing["data"] == incoming:
-            return
+            return None
 
         cursor.execute(
             """
@@ -385,6 +393,7 @@ def _archive_library_record_before_overwrite(
                 workspace_id, kind, record_id, data, row_updated_at, revised_at, source
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 workspace_id,
@@ -393,9 +402,10 @@ def _archive_library_record_before_overwrite(
                 Jsonb(existing["data"]),
                 existing["updated_at"],
                 now,
-                "sync_push",
+                (source or "sync_push")[:40],
             ),
         )
+        revision_row = cursor.fetchone()
         cursor.execute(
             """
             DELETE FROM library_record_revisions
@@ -408,10 +418,11 @@ def _archive_library_record_before_overwrite(
             """,
             (workspace_id, kind, record_id, _LIBRARY_REVISION_KEEP),
         )
+        return int(revision_row["id"]) if revision_row else None
     except Exception:
         # Never let history bookkeeping block a sync. Migration may not be
         # applied yet on a preview deploy; the upsert below still proceeds.
-        return
+        return None
 
 
 def push_changes(

@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     # what makes Blob work locally, where the value only exists in .env.local.
     blob_read_write_token: str = ""
 
+    # MCP remote server. When unset, /mcp returns 503 (never falls open).
+    mcp_token: str = ""
+    # First-boot fallback only; prefer app_settings.mcp_default_workspace.
+    mcp_default_workspace_id: str = ""
+    # Comma-separated hosts allowed for ingest_pdf_from_url (supports *.suffix).
+    mcp_ingest_allowed_hosts: str = ""
+
     @property
     def database_configured(self) -> bool:
         return bool(self.database_url.strip())

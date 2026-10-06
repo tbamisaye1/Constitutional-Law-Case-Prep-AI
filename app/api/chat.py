@@ -9,14 +9,12 @@ grounding_source:
   web_plus   — corpus + OpenRouter web search
 """
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter
-from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
-from app.agents.prep_graph import prep_graph
-from app.grounding.selection import build_chat_message
+from app.agents.run_chat import run_prep_chat
 from app.llm.openrouter import normalize_model_tier
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -48,7 +46,7 @@ class NotebookNoteIn(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
-    matter_id: str = "bronner-2026"
+    matter_id: str = ""
     grounding_source: GroundingSourceIn = "documents"
     # standard = gpt-4o-mini; advanced = gpt-5-mini (Ask AI Advanced toggle).
     model_tier: ModelTierIn = "standard"
@@ -92,18 +90,12 @@ class ChatResponse(BaseModel):
 def chat(body: ChatRequest):
     source = body.grounding_source or "documents"
     tier = normalize_model_tier(body.model_tier)
-    packed = build_chat_message(
-        body.message,
-        body.selection,
-        source_file=body.source_file,
-        page=body.page,
-    )
     history = [
         {"role": turn.role, "content": turn.content.strip()}
         for turn in (body.history or [])
         if turn.content and turn.content.strip()
-    ][-12:]
-    client_notes = [
+    ]
+    client_notes: list[dict[str, Any]] = [
         {
             "id": n.id,
             "title": n.title,
@@ -116,7 +108,7 @@ def chat(body: ChatRequest):
         }
         for n in (body.notes or [])
         if n.text and n.text.strip()
-    ][:8]
+    ]
     # Log enough to debug "answered the wrong case" without dumping full PDFs.
     sel = (body.selection or "").strip()
     src = (body.source_file or "").strip()
@@ -128,45 +120,26 @@ def chat(body: ChatRequest):
         f"q_preview={body.message[:120]!r} "
         f"sel_preview={sel[:160]!r}"
     )
-    result = prep_graph.invoke(
-        {
-            "messages": [HumanMessage(content=packed)],
-            "matter_id": body.matter_id,
-            "grounding_source": source,
-            "model_tier": tier,
-            "chat_history": history,
-            "client_notes": client_notes,
-            "evidence": [],
-        }
-    )
-
-    last = result["messages"][-1]
-    text = getattr(last, "content", str(last))
-    evidence_raw = result.get("evidence") or []
-    claims = result.get("claims") or []
-    verified = sum(1 for c in claims if c.get("verified"))
-
-    evidence_out = [
-        EvidenceOut(
-            id=e["id"],
-            source=e["source"],
-            page=e.get("page"),
-            source_type=e.get("source_type", "unknown"),
-            preview=(e.get("text") or "")[:220],
-            url=e.get("url"),
-            notes_path=e.get("notes_path"),
-        )
-        for e in evidence_raw
-    ]
-
-    return ChatResponse(
-        reply=text if isinstance(text, str) else str(text),
+    result = run_prep_chat(
+        body.message,
         matter_id=body.matter_id,
-        grounding_status=result.get("grounding_status") or "unverified",
-        grounding_notes=result.get("grounding_notes") or "",
         grounding_source=source,
         model_tier=tier,
-        evidence=evidence_out,
-        claims_verified=verified,
-        claims_total=len(claims),
+        selection=body.selection,
+        source_file=body.source_file,
+        page=body.page,
+        history=history,
+        notes=client_notes,
+    )
+
+    return ChatResponse(
+        reply=result["reply"],
+        matter_id=result["matter_id"],
+        grounding_status=result["grounding_status"],
+        grounding_notes=result["grounding_notes"],
+        grounding_source=result["grounding_source"],
+        model_tier=result["model_tier"],
+        evidence=[EvidenceOut(**row) for row in result["evidence"]],
+        claims_verified=result["claims_verified"],
+        claims_total=result["claims_total"],
     )

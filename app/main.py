@@ -5,6 +5,7 @@ CORS is open in local/dev so Vite (5173) can call us directly if the proxy
 is skipped. Tighten origins before any shared deploy.
 """
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,15 +13,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.api import backups, chat, documents, export, health, ingest, matters, sync
+from app.mcp.auth import McpAuth
+from app.mcp.server import mcp
 
 # >>> DEMO_START — Erin screen-share mockup; remove with: ./demo/remove_everything.sh
 _DEMO_HTML = Path(__file__).resolve().parents[1] / "demo" / "index.html"
 # >>> DEMO_END
 
+# Build the Streamable HTTP app before lifespan so session_manager exists.
+_mcp_http_app = mcp.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    async with mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
     title="Constitutional Law Case Prep AI",
     version="0.1.0",
     description="Agentic prep backend for YUMC / AMCA. Author: Tobi Bamisaye.",
+    lifespan=lifespan,
 )
 
 # >>> DEMO_START — widen CORS for Vercel preview/prod; remove with ./demo/remove_everything.sh
@@ -49,6 +63,13 @@ app.include_router(export.router)
 app.include_router(sync.router)
 app.include_router(backups.router)
 app.include_router(documents.router)
+
+# Remote MCP (Streamable HTTP). Auth never falls open when MCP_TOKEN is unset.
+# Mounted at both /mcp and /mcp/ so clients that omit/require the trailing slash
+# both work without a 307 that some MCP clients will not follow.
+_mcp_authed = McpAuth(_mcp_http_app)
+app.mount("/mcp", _mcp_authed)
+
 
 # >>> DEMO_START
 @app.get("/")
