@@ -596,6 +596,49 @@ def _pick_argument_notes(server_notes: str, incoming_notes: str, prong_id: str) 
     return server if len(server) >= len(incoming) else incoming
 
 
+def _looks_like_seed_draft_notes(notes: str) -> bool:
+    """Whole-argument / section notes that match the bundled Category 3 seed."""
+    norm = _norm_html(notes)
+    if not norm:
+        return False
+    if "We ask this court to reverse for 3 reasons" in norm and "The ladder (say this in the roadmap)" in norm:
+        return True
+    if norm.startswith("Introduction The Constitution lets the President turn the armed forces"):
+        return True
+    draft_seed = str(_CATEGORY3_SEED.get("draftNotes") or "")
+    if draft_seed:
+        seed_norm = _norm_html(draft_seed)
+        if seed_norm and (norm == seed_norm or norm.startswith(seed_norm[:100])):
+            return True
+    return False
+
+
+def _pick_rich_notes(server_notes: str, incoming_notes: str) -> str:
+    """
+    Prefer manual whole-argument / section notes over seed or thinner wipes.
+
+    Draft-level notes were previously taken from the incoming board wholesale,
+    so a seed Introduction push could erase "2nd Ebb considerations" text even
+    when prong-level protect kept the outline.
+    """
+    server = server_notes if isinstance(server_notes, str) else ""
+    incoming = incoming_notes if isinstance(incoming_notes, str) else ""
+    if not server.strip():
+        return incoming
+    if not incoming.strip():
+        return server
+    if server == incoming:
+        return incoming
+    server_seed = _looks_like_seed_draft_notes(server)
+    incoming_seed = _looks_like_seed_draft_notes(incoming)
+    if incoming_seed and not server_seed:
+        return server
+    if server_seed and not incoming_seed:
+        return incoming
+    # Keep the longer non-identical text. A short wipe must not beat a long note.
+    return server if len(server) >= len(incoming) else incoming
+
+
 # Old bundled title that kept winning over the user's Jackson-method rewrite
 # because the seed fingerprint file was updated to match the good title.
 _BAD_C3_S1_A_TITLES = {
@@ -646,7 +689,7 @@ def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) 
 
 def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) -> dict[str, Any]:
     """
-    Keep manual prong notes/titles when an incoming sync would re-apply seed.
+    Keep manual draft / section / prong notes when an incoming sync re-applies seed.
     Outline deletions on the incoming board still win (missing prong ids stay gone).
     """
     incoming_sides = incoming.get("draftsBySide")
@@ -673,6 +716,12 @@ def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) ->
             if not isinstance(server_draft, dict):
                 next_drafts.append(draft)
                 continue
+            draft_notes = _pick_rich_notes(
+                str(server_draft.get("notes") or ""),
+                str(draft.get("notes") or ""),
+            )
+            if draft_notes != draft.get("notes"):
+                changed = True
             server_sections = {
                 s.get("id"): s
                 for s in (server_draft.get("sections") or [])
@@ -687,6 +736,12 @@ def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) ->
                 if not isinstance(server_section, dict):
                     next_sections.append(section)
                     continue
+                section_notes = _pick_rich_notes(
+                    str(server_section.get("notes") or ""),
+                    str(section.get("notes") or ""),
+                )
+                if section_notes != section.get("notes"):
+                    changed = True
                 server_prongs = {
                     p.get("id"): p
                     for p in (server_section.get("prongs") or [])
@@ -715,8 +770,8 @@ def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) ->
                     if notes != prong.get("notes") or title != prong.get("title"):
                         changed = True
                     next_prongs.append({**prong, "notes": notes, "title": title})
-                next_sections.append({**section, "prongs": next_prongs})
-            next_drafts.append({**draft, "sections": next_sections})
+                next_sections.append({**section, "notes": section_notes, "prongs": next_prongs})
+            next_drafts.append({**draft, "notes": draft_notes, "sections": next_sections})
         merged_sides[side] = next_drafts
 
     if not changed:
