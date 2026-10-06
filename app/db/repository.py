@@ -550,12 +550,17 @@ def _seed_prong_title(prong_id: str) -> str:
 
 
 def _looks_like_seed_notes(prong_id: str, notes: str) -> bool:
-    seed = _seed_prong_notes(prong_id)
-    if not seed or not notes:
-        return False
     norm = _norm_html(notes)
+    if not norm:
+        return False
+    # Misplaced / old seed block that kept showing up under 2.1 in the UI.
+    if "Concede Hamdi on its own facts immediately" in norm and "The four sources they stack" in norm:
+        return True
+    seed = _seed_prong_notes(prong_id)
+    if not seed:
+        return False
     seed_norm = _norm_html(seed)
-    if not seed_norm or not norm:
+    if not seed_norm:
         return False
     if norm == seed_norm or norm.startswith(seed_norm[:80]):
         return True
@@ -564,6 +569,11 @@ def _looks_like_seed_notes(prong_id: str, notes: str) -> bool:
     if not match:
         return False
     heading = _norm_html(match.group(1))
+    # "Walk the three steps" is also in older seed; do not treat the user's
+    # "claim in one sentence" board as seed just because a later seed file
+    # reused Jackson language.
+    if heading.lower().startswith("walk the three steps") and "claim in one sentence" in norm.lower():
+        return False
     return bool(heading) and len(heading) >= 12 and heading in norm
 
 
@@ -586,6 +596,15 @@ def _pick_argument_notes(server_notes: str, incoming_notes: str, prong_id: str) 
     return server if len(server) >= len(incoming) else incoming
 
 
+# Old bundled title that kept winning over the user's Jackson-method rewrite
+# because the seed fingerprint file was updated to match the good title.
+_BAD_C3_S1_A_TITLES = {
+    "a. Under Youngstown, President falls into lowest Category",
+    "a. Under Youngstown, President falls into lowest ebb",
+}
+_GOOD_C3_S1_A_TITLE = "a. Jackson’s method, not just his labels"
+
+
 def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) -> str:
     server = server_title.strip() if isinstance(server_title, str) else ""
     incoming = incoming_title.strip() if isinstance(incoming_title, str) else ""
@@ -595,12 +614,29 @@ def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) 
         return server_title if isinstance(server_title, str) else server
     if server == incoming:
         return incoming_title if isinstance(incoming_title, str) else incoming
+
+    # c3-s1-a: never let the old Youngstown seed title overwrite Jackson method.
+    if prong_id == "c3-s1-a":
+        if incoming in _BAD_C3_S1_A_TITLES and (
+            server == _GOOD_C3_S1_A_TITLE or "Jackson" in server
+        ):
+            return server_title if isinstance(server_title, str) else server
+        if server in _BAD_C3_S1_A_TITLES and (
+            incoming == _GOOD_C3_S1_A_TITLE or "Jackson" in incoming
+        ):
+            return incoming_title if isinstance(incoming_title, str) else incoming
+
     seed_title = _seed_prong_title(prong_id)
     if seed_title:
         if incoming == seed_title and server != seed_title:
             return server_title if isinstance(server_title, str) else server
         if server == seed_title and incoming != seed_title:
-            return incoming_title if isinstance(incoming_title, str) else incoming
+            # Do not treat the current good Jackson title as disposable seed.
+            if prong_id == "c3-s1-a" and server == _GOOD_C3_S1_A_TITLE:
+                if incoming in _BAD_C3_S1_A_TITLES:
+                    return server_title if isinstance(server_title, str) else server
+            else:
+                return incoming_title if isinstance(incoming_title, str) else incoming
     return (
         (server_title if isinstance(server_title, str) else server)
         if len(server) >= len(incoming)
@@ -688,6 +724,23 @@ def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) ->
     return {**incoming, "draftsBySide": merged_sides}
 
 
+def _c3_s1_a_title(board: dict[str, Any]) -> str:
+    try:
+        drafts = (board.get("draftsBySide") or {}).get("petitioner") or []
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            for section in draft.get("sections") or []:
+                if not isinstance(section, dict) or section.get("id") != "c3-s1":
+                    continue
+                for prong in section.get("prongs") or []:
+                    if isinstance(prong, dict) and prong.get("id") == "c3-s1-a":
+                        return str(prong.get("title") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
 def _protect_arguments_from_seed_or_thinner_push(
     cursor,
     workspace_id: str,
@@ -714,7 +767,17 @@ def _protect_arguments_from_seed_or_thinner_push(
         existing = cursor.fetchone()
         if not existing or not isinstance(existing.get("data"), dict):
             return prepared
-        merged = _merge_arguments_boards(incoming, existing["data"])
+        server = existing["data"]
+        server_title = _c3_s1_a_title(server)
+        incoming_title = _c3_s1_a_title(incoming)
+        # Open tabs were stomping a manual Jackson-method restore every second
+        # with the older Youngstown seed title. Refuse that whole overwrite.
+        if (
+            server_title == _GOOD_C3_S1_A_TITLE
+            and incoming_title in _BAD_C3_S1_A_TITLES
+        ):
+            return {**prepared, "data": server}
+        merged = _merge_arguments_boards(incoming, server)
         if merged != incoming:
             return {**prepared, "data": merged}
     except Exception:
