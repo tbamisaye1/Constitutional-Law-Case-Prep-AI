@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -48,8 +50,15 @@ def clamp_limit(limit: int | None, default: int = 50, maximum: int = 200) -> int
 
 
 def tool_guard(fn: Callable[..., Any]) -> Callable[..., Any]:
-    """Decorator: convert McpToolError to structured error dicts."""
+    """
+    Convert McpToolError to structured error dicts.
 
+    Must preserve the original signature. FastMCP builds the tool input schema
+    from the callable it receives; a bare `*args, **kwargs` wrapper publishes
+    those names as required inputs and every client call fails.
+    """
+
+    @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return await fn(*args, **kwargs)
@@ -61,6 +70,6 @@ def tool_guard(fn: Callable[..., Any]) -> Callable[..., Any]:
                 str(exc) or exc.__class__.__name__,
             )
 
-    wrapper.__name__ = getattr(fn, "__name__", "tool")
-    wrapper.__doc__ = getattr(fn, "__doc__", "")
+    # FastMCP reads __signature__ directly in some paths; set it explicitly.
+    wrapper.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
     return wrapper
