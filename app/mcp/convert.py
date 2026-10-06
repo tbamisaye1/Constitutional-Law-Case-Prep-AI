@@ -3,7 +3,8 @@ Markdown ↔ TipTap-safe HTML for MCP note tools.
 
 Reads return both formats. Writes accept exactly one of markdown or html.
 Only the TipTap-safe subset survives conversion: h2, h3, p, ul, ol, li,
-strong, em, a, blockquote, code.
+strong, em, a, blockquote, code, plus Arguments sub-point headings
+(<h1 data-outline="point" data-id="…">), which live inside a prong's notes.
 """
 
 from __future__ import annotations
@@ -56,11 +57,49 @@ def html_to_markdown(html: str) -> str:
     return html_to_md(html, heading_style="ATX", bullets="-").strip()
 
 
+_POINT_RE = re.compile(r"<h1\b([^>]*)>(.*?)</h1>", re.I | re.S)
+_POINT_ATTR_RE = re.compile(r'data-outline\s*=\s*["\']point["\']', re.I)
+_POINT_ID_RE = re.compile(r'data-id\s*=\s*["\']([A-Za-z0-9_-]{1,80})["\']', re.I)
+_POINT_OPEN = "\x00POINT:{}\x00"
+_POINT_CLOSE = "\x00/POINT\x00"
+
+
+def _protect_points(html: str) -> str:
+    """
+    Swap sub-point headings for sentinels so the tag pass cannot strip them.
+
+    The Arguments page stores 1.1.1 sub-points as h1 headings inside a prong's
+    notes. Any other h1 is still dropped (only its text survives).
+    """
+
+    def _swap(match: re.Match[str]) -> str:
+        attrs, inner = match.group(1), match.group(2)
+        if not _POINT_ATTR_RE.search(attrs):
+            return match.group(0)
+        id_match = _POINT_ID_RE.search(attrs)
+        point_id = id_match.group(1) if id_match else ""
+        return _POINT_OPEN.format(point_id) + inner + _POINT_CLOSE
+
+    return _POINT_RE.sub(_swap, html)
+
+
+def _restore_points(html: str) -> str:
+    def _open(match: re.Match[str]) -> str:
+        point_id = match.group(1)
+        id_attr = f' data-id="{point_id}"' if point_id else ""
+        return f'<h1 data-outline="point"{id_attr}>'
+
+    html = re.sub(r"\x00POINT:([A-Za-z0-9_-]*)\x00", _open, html)
+    return html.replace(_POINT_CLOSE, "</h1>")
+
+
 def sanitize_tiptap_html(html: str) -> str:
     """Strip tags outside the TipTap-safe subset; keep href on anchors."""
     if not html:
         return ""
-    cleaned = _SCRIPT_RE.sub("", html)
+    # Sentinels are NUL-delimited; never trust any that arrive from outside.
+    cleaned = _SCRIPT_RE.sub("", html.replace("\x00", ""))
+    cleaned = _protect_points(cleaned)
 
     def _replace(match: re.Match[str]) -> str:
         tag = match.group(1).lower()
@@ -88,7 +127,7 @@ def sanitize_tiptap_html(html: str) -> str:
             return "<br />"
         return f"<{tag}>"
 
-    return _TAG_RE.sub(_replace, cleaned)
+    return _restore_points(_TAG_RE.sub(_replace, cleaned))
 
 
 def format_note_payload(
