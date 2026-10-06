@@ -134,9 +134,10 @@ def test_protect_arguments_uses_server_when_push_is_seed():
             }
         },
     }
-    out = _protect_arguments_from_seed_or_thinner_push(_Cursor(existing), "ws", prepared)
+    out, reason = _protect_arguments_from_seed_or_thinner_push(_Cursor(existing), "ws", prepared)
     notes = out["data"]["draftsBySide"]["petitioner"][0]["sections"][0]["prongs"][0]["notes"]
     assert "The claim in one sentence" in notes
+    assert reason is not None
 
 
 def test_seed_draft_fingerprint():
@@ -149,9 +150,71 @@ def test_pick_rich_notes_keeps_manual_over_seed():
     assert _pick_rich_notes(SEED_DRAFT, MANUAL_DRAFT) == MANUAL_DRAFT
 
 
-def test_pick_rich_notes_blocks_short_wipe():
+def test_pick_rich_notes_allows_short_edit_and_clear():
     long_notes = MANUAL_DRAFT + (" more" * 40)
-    assert _pick_rich_notes(long_notes, "<p>x</p>") == long_notes
+    assert _pick_rich_notes(long_notes, "<p>trimmed</p>") == "<p>trimmed</p>"
+    assert _pick_rich_notes(long_notes, "") == ""
+
+
+def test_pick_argument_notes_shorter_manual_wins():
+    long_server = "<p>" + ("old outline " * 40) + "</p>"
+    short_edit = "<p>short rewrite</p>"
+    assert _pick_argument_notes(long_server, short_edit, "c3-s2-a") == short_edit
+
+
+def test_protect_arguments_returns_rejection_reason():
+    existing = {
+        "data": {
+            "draftsBySide": {
+                "petitioner": [
+                    {
+                        "id": "alt-q2-ladder",
+                        "sections": [
+                            {
+                                "id": "c3-s1",
+                                "prongs": [
+                                    {
+                                        "id": "c3-s1-a",
+                                        "title": "a. Under Youngstown",
+                                        "notes": "<h2>Jackson's test</h2><p>manual</p>",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+    prepared = {
+        "kind": "arguments",
+        "id": "main",
+        "data": {
+            "draftsBySide": {
+                "petitioner": [
+                    {
+                        "id": "alt-q2-ladder",
+                        "sections": [
+                            {
+                                "id": "c3-s1",
+                                "prongs": [
+                                    {
+                                        "id": "c3-s1-a",
+                                        "title": "a. Jackson’s method, not just his labels",
+                                        "notes": "<h2>Walk the three steps he walked</h2><ol><li>Category 1 out</li></ol>",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+    out, reason = _protect_arguments_from_seed_or_thinner_push(_Cursor(existing), "ws", prepared)
+    assert reason == "arguments_rejected_agent_jackson_title"
+    notes = out["data"]["draftsBySide"]["petitioner"][0]["sections"][0]["prongs"][0]["notes"]
+    assert "Jackson's test" in notes
 
 
 def test_merge_keeps_whole_argument_notes_when_seed_arrives():

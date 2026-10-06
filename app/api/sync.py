@@ -55,6 +55,9 @@ class SyncResponse(BaseModel):
     server_time: int = Field(alias="serverTime")
     changes: dict[str, list[dict[str, Any]]]
     written: dict[str, int] = Field(default_factory=dict)
+    # Rows the server refused or rewrote (e.g. seed Arguments). Empty on a
+    # normal successful push so older clients that ignore unknown fields stay fine.
+    rejected: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -129,7 +132,9 @@ def push_then_pull(
         event="push_then_pull",
     )
 
-    written = push_changes(session.cursor, session.workspace_id, body.changes, now)
+    written, rejected = push_changes(
+        session.cursor, session.workspace_id, body.changes, now
+    )
     changes = pull_changes(session.cursor, session.workspace_id, body.since)
 
     if unknown:
@@ -142,12 +147,17 @@ def push_then_pull(
         bits = [p for p in (audit.get("note") or "").split(",") if p]
         bits.append(f"wrote_library_records={written.get('library_records')}")
         audit["note"] = ",".join(dict.fromkeys(bits))
+    if rejected:
+        bits = [p for p in (audit.get("note") or "").split(",") if p]
+        bits.append("rejected=" + ",".join(r.get("reason") or "?" for r in rejected))
+        audit["note"] = ",".join(dict.fromkeys(bits))
     record_sync_audit(session.cursor, session.workspace_id, audit, now)
 
     return SyncResponse(
         serverTime=to_epoch_ms(now),
         changes=changes,
         written=written,
+        rejected=rejected,
     )
 
 

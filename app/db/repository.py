@@ -419,7 +419,7 @@ def push_changes(
     workspace_id: str,
     payload: dict[str, Sequence[dict]],
     now: datetime,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], list[dict[str, Any]]]:
     """
     Upsert client rows, keeping whichever version has the newer updatedAt.
 
@@ -432,10 +432,12 @@ def push_changes(
         now: Server time used to clamp client clocks and stamp tombstones.
 
     Returns:
-        Collection name to the number of rows actually written. A row that lost
-        the conflict does not count, which makes a stale client visible.
+        (written, rejected). written maps collection name to rows actually
+        written. rejected lists Arguments (and similar) rows where protect
+        refused or rewrote the client's payload so the UI can warn.
     """
     written: dict[str, int] = {}
+    rejected: list[dict[str, Any]] = []
 
     for name, rows in payload.items():
         spec = ENTITY_BY_NAME.get(name)
@@ -465,18 +467,31 @@ def push_changes(
         touched_backup_kinds = False
         for row in rows[:MAX_ROWS_PER_ENTITY]:
             prepared = _with_push_defaults(spec, row)
+            reject_reason: str | None = None
             if name == "library_records":
                 if prepared.get("kind") in _BACKUP_TRIGGER_KINDS:
                     touched_backup_kinds = True
                 prepared = _protect_notebook_from_smaller_push(
                     cursor, workspace_id, prepared
                 )
-                prepared = _protect_arguments_from_seed_or_thinner_push(
+                prepared, reject_reason = _protect_arguments_from_seed_or_thinner_push(
                     cursor, workspace_id, prepared
                 )
                 prepared = _protect_rich_library_text_from_thinner_push(
                     cursor, workspace_id, prepared
                 )
+                if reject_reason:
+                    # Stamp server time so the pull echoes the kept board and
+                    # the client does not stay on a discarded local edit.
+                    prepared = {**prepared, "updatedAt": to_epoch_ms(now)}
+                    rejected.append(
+                        {
+                            "collection": name,
+                            "kind": prepared.get("kind"),
+                            "id": prepared.get("id"),
+                            "reason": reject_reason,
+                        }
+                    )
                 _archive_library_record_before_overwrite(
                     cursor, workspace_id, prepared, now
                 )
@@ -489,7 +504,7 @@ def push_changes(
         if name == "library_records" and touched_backup_kinds and count:
             maybe_auto_backup_workspace(cursor, workspace_id, now, reason="sync_push")
 
-    return written
+    return written, rejected
 
 
 _SYNC_AUDIT_KEEP = 500
@@ -783,6 +798,12 @@ def _looks_like_seed_notes(prong_id: str, notes: str) -> bool:
     # Misplaced / old seed block that kept showing up under 2.1 in the UI.
     if "Concede Hamdi on its own facts immediately" in norm and "The four sources they stack" in norm:
         return True
+    # Bundled Category 3 opener. Treat any Walk-the-three-steps heading as seed
+    # unless the text also carries the agent "claim in one sentence" fingerprint
+    # (that board was user/restore content, not the starter outline).
+    norm_lower = norm.lower()
+    if "walk the three steps" in norm_lower and "claim in one sentence" not in norm_lower:
+        return True
     seed = _seed_prong_notes(prong_id)
     if not seed:
         return False
@@ -805,13 +826,21 @@ def _looks_like_seed_notes(prong_id: str, notes: str) -> bool:
 
 
 def _pick_argument_notes(server_notes: str, incoming_notes: str, prong_id: str) -> str:
+    """
+    Prefer the client's newest edit.
+
+    Longer-wins used to silently undo trims and clears. Only block the bundled
+    Category 3 seed and the agent Jackson restore fingerprint when those would
+    overwrite real notes.
+    """
     server = server_notes if isinstance(server_notes, str) else ""
     incoming = incoming_notes if isinstance(incoming_notes, str) else ""
-    if not server.strip():
-        return incoming
-    if not incoming.strip():
-        return server
     if server == incoming:
+        return incoming
+    # Empty incoming is a deliberate clear — allow it.
+    if not incoming.strip():
+        return incoming
+    if not server.strip():
         return incoming
     # Agent "claim in one sentence" restore must not beat manual prong notes.
     if prong_id == "c3-s1-a":
@@ -823,12 +852,11 @@ def _pick_argument_notes(server_notes: str, incoming_notes: str, prong_id: str) 
             return incoming
     server_seed = _looks_like_seed_notes(prong_id, server)
     incoming_seed = _looks_like_seed_notes(prong_id, incoming)
-    # Seed must never replace a divergent manual edit, even if seed is longer.
     if incoming_seed and not server_seed:
         return server
     if server_seed and not incoming_seed:
         return incoming
-    return server if len(server) >= len(incoming) else incoming
+    return incoming
 
 
 def _looks_like_seed_draft_notes(notes: str) -> bool:
@@ -850,19 +878,17 @@ def _looks_like_seed_draft_notes(notes: str) -> bool:
 
 def _pick_rich_notes(server_notes: str, incoming_notes: str) -> str:
     """
-    Prefer manual whole-argument / section notes over seed or thinner wipes.
+    Prefer the client's newest whole-argument / section notes.
 
-    Draft-level notes were previously taken from the incoming board wholesale,
-    so a seed Introduction push could erase "2nd Ebb considerations" text even
-    when prong-level protect kept the outline.
+    Seed outline text still loses to manual notes. Length is not a signal.
     """
     server = server_notes if isinstance(server_notes, str) else ""
     incoming = incoming_notes if isinstance(incoming_notes, str) else ""
-    if not server.strip():
+    if server == incoming:
         return incoming
     if not incoming.strip():
-        return server
-    if server == incoming:
+        return incoming
+    if not server.strip():
         return incoming
     server_seed = _looks_like_seed_draft_notes(server)
     incoming_seed = _looks_like_seed_draft_notes(incoming)
@@ -870,8 +896,7 @@ def _pick_rich_notes(server_notes: str, incoming_notes: str) -> str:
         return server
     if server_seed and not incoming_seed:
         return incoming
-    # Keep the longer non-identical text. A short wipe must not beat a long note.
-    return server if len(server) >= len(incoming) else incoming
+    return incoming
 
 
 # Agent-written title/notes that must never beat the user's outline.
@@ -894,11 +919,12 @@ def _looks_like_ai_prong_notes(notes: str) -> bool:
 def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) -> str:
     server = server_title.strip() if isinstance(server_title, str) else ""
     incoming = incoming_title.strip() if isinstance(incoming_title, str) else ""
-    if not server:
-        return incoming_title if isinstance(incoming_title, str) else incoming
-    if not incoming:
-        return server_title if isinstance(server_title, str) else server
     if server == incoming:
+        return incoming_title if isinstance(incoming_title, str) else incoming
+    # Empty title is a deliberate clear.
+    if not incoming:
+        return incoming_title if isinstance(incoming_title, str) else incoming
+    if not server:
         return incoming_title if isinstance(incoming_title, str) else incoming
 
     # c3-s1-a: never let agent Jackson-method title overwrite the user's title.
@@ -914,17 +940,14 @@ def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) 
             return server_title if isinstance(server_title, str) else server
         if server == seed_title and incoming != seed_title:
             return incoming_title if isinstance(incoming_title, str) else incoming
-    return (
-        (server_title if isinstance(server_title, str) else server)
-        if len(server) >= len(incoming)
-        else (incoming_title if isinstance(incoming_title, str) else incoming)
-    )
+    return incoming_title if isinstance(incoming_title, str) else incoming
 
 
 def _merge_arguments_boards(incoming: dict[str, Any], server: dict[str, Any]) -> dict[str, Any]:
     """
     Keep manual draft / section / prong notes when an incoming sync re-applies seed.
     Outline deletions on the incoming board still win (missing prong ids stay gone).
+    Newest non-seed / non-agent edits win, including shorter text and clears.
     """
     incoming_sides = incoming.get("draftsBySide")
     server_sides = server.get("draftsBySide")
@@ -1034,15 +1057,19 @@ def _protect_arguments_from_seed_or_thinner_push(
     cursor,
     workspace_id: str,
     prepared: dict[str, Any],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str | None]:
     """
-    Block Category 3 seed (or thinner) argument pushes from erasing manual notes.
+    Block Category 3 seed / agent Jackson restores from erasing manual notes.
+
+    Returns (prepared_row, rejection_reason). Rejection reason is set when the
+    server refuses or rewrites any part of the incoming Arguments board so the
+    client can warn instead of silently diverging.
     """
     if prepared.get("kind") != "arguments":
-        return prepared
+        return prepared, None
     incoming = prepared.get("data")
     if not isinstance(incoming, dict):
-        return prepared
+        return prepared, None
     try:
         cursor.execute(
             """
@@ -1055,7 +1082,7 @@ def _protect_arguments_from_seed_or_thinner_push(
         )
         existing = cursor.fetchone()
         if not existing or not isinstance(existing.get("data"), dict):
-            return prepared
+            return prepared, None
         server = existing["data"]
         server_title = _c3_s1_a_title(server)
         incoming_title = _c3_s1_a_title(incoming)
@@ -1065,7 +1092,7 @@ def _protect_arguments_from_seed_or_thinner_push(
             server_title not in _AI_C3_S1_A_TITLES
             and incoming_title in _AI_C3_S1_A_TITLES
         ):
-            return {**prepared, "data": server}
+            return {**prepared, "data": server}, "arguments_rejected_agent_jackson_title"
 
         def _c3_notes(board: dict[str, Any]) -> str:
             try:
@@ -1084,17 +1111,23 @@ def _protect_arguments_from_seed_or_thinner_push(
 
         server_notes = _c3_notes(server)
         incoming_notes = _c3_notes(incoming)
+        # Whole-board refuse only when the push is the agent restore fingerprint
+        # and the server does not already have that fingerprint. Field merge
+        # handles mixed boards; length never decides.
         if _looks_like_ai_prong_notes(incoming_notes) and not _looks_like_ai_prong_notes(
             server_notes
         ):
-            return {**prepared, "data": server}
+            return {**prepared, "data": server}, "arguments_rejected_agent_claim_notes"
 
         merged = _merge_arguments_boards(incoming, server)
         if merged != incoming:
-            return {**prepared, "data": merged}
+            return (
+                {**prepared, "data": merged},
+                "arguments_rejected_seed_content",
+            )
     except Exception:
-        return prepared
-    return prepared
+        return prepared, None
+    return prepared, None
 
 
 def _protect_rich_library_text_from_thinner_push(
