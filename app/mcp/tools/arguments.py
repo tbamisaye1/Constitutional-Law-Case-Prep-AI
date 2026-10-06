@@ -15,6 +15,7 @@ from app.mcp.arguments_shape import (
     find_section,
     joined_markdown,
     validate_arguments_board,
+    append_scratch_html,
 )
 from app.mcp.convert import format_note_payload, resolve_write_body
 from app.mcp.dbutil import run_db_async, tool_guard
@@ -142,6 +143,10 @@ async def get_arguments(
                     "notes": format_note_payload(
                         draft.get("notes") or "", format=format  # type: ignore[arg-type]
                     ),
+                    # Free-form side notes from the Arguments page scratch pane.
+                    "scratch": format_note_payload(
+                        draft.get("scratch") or "", format=format  # type: ignore[arg-type]
+                    ),
                     "sections": [],
                 }
                 for section in draft.get("sections") or []:
@@ -266,6 +271,85 @@ async def set_draft_notes(
             wid,
             next_board,
             tool_name="set_draft_notes",
+            expected_updated_at=expected_updated_at,
+        )
+
+    return await run_db_async(_sync)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
+)
+@tool_guard
+async def append_to_draft_scratch(
+    side: str,
+    draft_id: str,
+    markdown: str | None = None,
+    html: str | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Append a note to the end of a draft's scratch pane (the messy-notes column
+    beside the Arguments page).
+
+    No expected_updated_at: appending is safe to replay on the latest board
+    (the row is locked FOR UPDATE), so an open browser tab cannot make this
+    conflict. Use set_draft_scratch to replace the whole scratch instead.
+    """
+
+    def _sync(cursor) -> dict[str, Any]:
+        wid = resolve_workspace_id(cursor, workspace_id)
+        try:
+            body = resolve_write_body(markdown=markdown, html=html)
+        except ValueError as exc:
+            raise McpToolError("invalid", str(exc)) from exc
+        board, current = _load_board(cursor, wid)
+        if current is None:
+            raise McpToolError("not_found", "No Arguments board yet.")
+        next_board = deep_copy_board(board)
+        draft = find_draft(next_board, side, draft_id)
+        append_scratch_html(draft, body)
+        return _save_board(
+            cursor,
+            wid,
+            next_board,
+            tool_name="append_to_draft_scratch",
+            expected_updated_at=current,
+        )
+
+    return await run_db_async(_sync)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False)
+)
+@tool_guard
+async def set_draft_scratch(
+    side: str,
+    draft_id: str,
+    expected_updated_at: int,
+    markdown: str | None = None,
+    html: str | None = None,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
+    """Replace a draft's scratch notes (read with get_arguments first)."""
+
+    def _sync(cursor) -> dict[str, Any]:
+        wid = resolve_workspace_id(cursor, workspace_id)
+        try:
+            body = resolve_write_body(markdown=markdown, html=html)
+        except ValueError as exc:
+            raise McpToolError("invalid", str(exc)) from exc
+        board, current = _load_board(cursor, wid)
+        _require_version(current, expected_updated_at, board)
+        next_board = deep_copy_board(board)
+        draft = find_draft(next_board, side, draft_id)
+        draft["scratch"] = body
+        return _save_board(
+            cursor,
+            wid,
+            next_board,
+            tool_name="set_draft_scratch",
             expected_updated_at=expected_updated_at,
         )
 

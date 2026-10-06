@@ -153,6 +153,20 @@ def joined_markdown(draft: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def append_scratch_html(draft: dict[str, Any], html: str) -> dict[str, Any]:
+    """
+    Append HTML to draft["scratch"], treating an empty TipTap doc ("<p></p>")
+    as empty. Mutates and returns the draft.
+    """
+    if not isinstance(html, str) or not html.strip():
+        raise McpToolError("invalid", "Nothing to append.")
+    current = draft.get("scratch")
+    if not isinstance(current, str) or current.strip() in ("", "<p></p>"):
+        current = ""
+    draft["scratch"] = current + html
+    return draft
+
+
 def deep_copy_board(data: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(data)
 
