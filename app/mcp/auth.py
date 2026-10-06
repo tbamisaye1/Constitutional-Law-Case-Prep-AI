@@ -20,7 +20,9 @@ from typing import Any
 
 from app.config import get_settings
 
-_SECRET_PATH_RE = re.compile(r"^/k/([^/]+)/?$")
+# Starlette Mount may leave the full "/mcp/..." path (root_path="/mcp") or
+# strip it to "/k/...". Accept both.
+_SECRET_PATH_RE = re.compile(r"^(?:/mcp)?/k/([^/]+)/?$")
 
 
 def _configured_token() -> str:
@@ -29,6 +31,8 @@ def _configured_token() -> str:
 
 def _tokens_match(provided: str, expected: str) -> bool:
     if not provided or not expected:
+        return False
+    if len(provided) != len(expected):
         return False
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
@@ -48,6 +52,16 @@ def _json_response(send, status: int, body: bytes) -> Any:
         await send({"type": "http.response.body", "body": body})
 
     return _send_response()
+
+
+def _normalize_mcp_path(path: str) -> str:
+    """Strip a leading /mcp so the Streamable HTTP app sees '/' or '/…'."""
+    if path == "/mcp":
+        return "/"
+    if path.startswith("/mcp/"):
+        rest = path[4:]
+        return rest if rest.startswith("/") else f"/{rest}"
+    return path or "/"
 
 
 class McpAuth:
@@ -71,17 +85,10 @@ class McpAuth:
             return
 
         path = scope.get("path") or ""
-        # When mounted at /mcp, Starlette strips the prefix; remaining path is
-        # "", "/", or "/k/<token>".
         secret_match = _SECRET_PATH_RE.match(path)
         provided = ""
         if secret_match:
             provided = secret_match.group(1)
-            # Rewrite to the streamable HTTP root so the SDK sees "/".
-            scope = dict(scope)
-            scope["path"] = "/"
-            # Never leave the raw token in scope for downstream logging.
-            scope["raw_path"] = b"/"
         else:
             headers = {
                 k.decode("latin1").lower(): v.decode("latin1")
@@ -99,10 +106,32 @@ class McpAuth:
             )
             return
 
-        # Normalize empty path so POST /mcp (no trailing slash) hits "/".
-        if scope.get("path") in ("", None):
-            scope = dict(scope)
+        # Rewrite path for the Streamable HTTP app (root is "/").
+        scope = dict(scope)
+        scope["path"] = _normalize_mcp_path(path)
+        # Secret URL: never leave the raw token in scope for downstream logging.
+        if secret_match:
             scope["path"] = "/"
-            scope["raw_path"] = b"/"
+        if scope["path"] in ("", None):
+            scope["path"] = "/"
+        scope["raw_path"] = scope["path"].encode("utf-8")
 
+        await self.app(scope, receive, send)
+
+
+class SlashlessMcpMiddleware:
+    """
+    Rewrite POST/GET /mcp → /mcp/ before Starlette Mount issues a 307.
+
+    Some MCP clients will not follow that redirect.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"
+            scope["raw_path"] = b"/mcp/"
         await self.app(scope, receive, send)

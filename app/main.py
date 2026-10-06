@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from app.api import backups, chat, documents, export, health, ingest, matters, sync
-from app.mcp.auth import McpAuth
+from app.mcp.auth import McpAuth, SlashlessMcpMiddleware
 from app.mcp.server import mcp
 
 # >>> DEMO_START — Erin screen-share mockup; remove with: ./demo/remove_everything.sh
@@ -54,6 +54,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Outermost: stop Starlette Mount from 307-redirecting /mcp → /mcp/.
+app.add_middleware(SlashlessMcpMiddleware)
 
 app.include_router(health.router)
 app.include_router(matters.router)

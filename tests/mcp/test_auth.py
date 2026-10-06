@@ -82,3 +82,14 @@ def test_secret_path_accepted(monkeypatch):
         response = client.post(f"/k/{token}")
     assert response.status_code == 200
     assert response.json()["ok"] is True
+
+
+def test_secret_path_with_mcp_prefix(monkeypatch):
+    """Starlette Mount may leave the full /mcp/k/... path unstripped."""
+    token = "d" * 32
+    monkeypatch.setenv("MCP_TOKEN", token)
+    get_settings.cache_clear()
+    with _make_client(token) as client:
+        response = client.post(f"/mcp/k/{token}")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
