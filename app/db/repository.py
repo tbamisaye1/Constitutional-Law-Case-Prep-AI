@@ -286,6 +286,83 @@ def _push_values(
     return tuple(values)
 
 
+# How many prior library_records payloads to keep per (workspace, kind, id).
+# Enough to recover a bad seed bump or mistaken restore without unbounded growth.
+_LIBRARY_REVISION_KEEP = 40
+
+
+def _archive_library_record_before_overwrite(
+    cursor,
+    workspace_id: str,
+    row: dict[str, Any],
+    now: datetime,
+) -> None:
+    """
+    Copy the current library_records.data into history when a push would change it.
+
+    Sync itself stays last-write-wins. This archive exists so a wiped arguments
+    board (or notebook / guide edits) can be pulled back without Neon PITR.
+    """
+    kind = row.get("kind")
+    record_id = row.get("id")
+    if not isinstance(kind, str) or not isinstance(record_id, str):
+        return
+
+    try:
+        cursor.execute(
+            """
+            SELECT data, updated_at
+            FROM library_records
+            WHERE workspace_id = %s AND kind = %s AND id = %s AND deleted_at IS NULL
+            """,
+            (workspace_id, kind, record_id),
+        )
+        existing = cursor.fetchone()
+        if not existing:
+            return
+
+        incoming = row.get("data")
+        if incoming is None:
+            return
+        # Skip archive when the payload is identical; avoids noise on heartbeat syncs.
+        if existing["data"] == incoming:
+            return
+
+        cursor.execute(
+            """
+            INSERT INTO library_record_revisions (
+                workspace_id, kind, record_id, data, row_updated_at, revised_at, source
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                workspace_id,
+                kind,
+                record_id,
+                Jsonb(existing["data"]),
+                existing["updated_at"],
+                now,
+                "sync_push",
+            ),
+        )
+        cursor.execute(
+            """
+            DELETE FROM library_record_revisions
+            WHERE id IN (
+                SELECT id FROM library_record_revisions
+                WHERE workspace_id = %s AND kind = %s AND record_id = %s
+                ORDER BY revised_at DESC
+                OFFSET %s
+            )
+            """,
+            (workspace_id, kind, record_id, _LIBRARY_REVISION_KEEP),
+        )
+    except Exception:
+        # Never let history bookkeeping block a sync. Migration may not be
+        # applied yet on a preview deploy; the upsert below still proceeds.
+        return
+
+
 def push_changes(
     cursor,
     workspace_id: str,
@@ -335,9 +412,14 @@ def push_changes(
 
         count = 0
         for row in rows[:MAX_ROWS_PER_ENTITY]:
+            prepared = _with_push_defaults(spec, row)
+            if name == "library_records":
+                _archive_library_record_before_overwrite(
+                    cursor, workspace_id, prepared, now
+                )
             cursor.execute(
                 statement,
-                _push_values(spec, workspace_id, _with_push_defaults(spec, row), now),
+                _push_values(spec, workspace_id, prepared, now),
             )
             count += cursor.rowcount
         written[name] = count
