@@ -29,8 +29,22 @@ MAX_ROWS_PER_ENTITY = 2_000
 
 # Critical prep docs: auto-backup when any of these kinds change.
 _BACKUP_TRIGGER_KINDS = frozenset(
-    {"notebook", "arguments", "guide_edits", "facts", "openings"}
+    {
+        "notebook",
+        "arguments",
+        "guide_edits",
+        "facts",
+        "openings",
+        "opinions",
+        "case_facts",
+        "cites",
+        "timeline",
+    }
 )
+
+# Text fields on opinion / fact cards. A thinner push must not erase longer prose.
+_RICH_TEXT_KINDS = frozenset({"opinions", "case_facts"})
+_RICH_TEXT_FIELDS = ("bodyHtml", "notes", "summary", "text", "holding", "rule")
 _AUTO_BACKUP_MIN_INTERVAL_SECONDS = 60 * 60  # one auto snapshot per hour
 _AUTO_BACKUP_KEEP = 200  # ~8 days of hourly + headroom
 _MANUAL_BACKUP_KEEP = 100
@@ -430,6 +444,9 @@ def push_changes(
                 prepared = _protect_notebook_from_smaller_push(
                     cursor, workspace_id, prepared
                 )
+                prepared = _protect_rich_library_text_from_thinner_push(
+                    cursor, workspace_id, prepared
+                )
                 _archive_library_record_before_overwrite(
                     cursor, workspace_id, prepared, now
                 )
@@ -476,6 +493,63 @@ def _protect_notebook_from_smaller_push(
             return prepared
         merged = merge_notebook_snapshots(incoming, existing["data"])
         if merged != incoming:
+            return {**prepared, "data": merged}
+    except Exception:
+        return prepared
+    return prepared
+
+
+def _protect_rich_library_text_from_thinner_push(
+    cursor,
+    workspace_id: str,
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Keep longer opinion / case-fact prose when a newer but thinner client push
+    would otherwise blank it (seed reload, partial localStorage, hard refresh).
+    """
+    kind = prepared.get("kind")
+    if kind not in _RICH_TEXT_KINDS:
+        return prepared
+    incoming = prepared.get("data")
+    if not isinstance(incoming, dict):
+        return prepared
+
+    try:
+        cursor.execute(
+            """
+            SELECT data
+            FROM library_records
+            WHERE workspace_id = %s AND kind = %s AND id = %s
+              AND deleted_at IS NULL
+            """,
+            (workspace_id, kind, prepared.get("id")),
+        )
+        existing = cursor.fetchone()
+        if not existing or not isinstance(existing.get("data"), dict):
+            return prepared
+        server = existing["data"]
+        merged = dict(incoming)
+        changed = False
+        for field in _RICH_TEXT_FIELDS:
+            incoming_text = merged.get(field)
+            server_text = server.get(field)
+            if not isinstance(server_text, str) or not server_text.strip():
+                continue
+            if not isinstance(incoming_text, str) or len(server_text) > len(incoming_text) + 40:
+                merged[field] = server_text
+                changed = True
+        # Opinions UI reads bodyHtml || notes — keep them aligned when one side has prose.
+        if kind == "opinions":
+            body = merged.get("bodyHtml") if isinstance(merged.get("bodyHtml"), str) else ""
+            notes = merged.get("notes") if isinstance(merged.get("notes"), str) else ""
+            if len(body) > len(notes) + 20:
+                merged["notes"] = body
+                changed = True
+            elif len(notes) > len(body) + 20:
+                merged["bodyHtml"] = notes
+                changed = True
+        if changed:
             return {**prepared, "data": merged}
     except Exception:
         return prepared
