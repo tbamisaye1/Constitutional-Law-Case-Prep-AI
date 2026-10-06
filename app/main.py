@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.api import chat, documents, export, health, ingest, matters, sync
+from app.api import backups, chat, documents, export, health, ingest, matters, sync
 
 # >>> DEMO_START — Erin screen-share mockup; remove with: ./demo/remove_everything.sh
 _DEMO_HTML = Path(__file__).resolve().parents[1] / "demo" / "index.html"
@@ -47,6 +47,7 @@ app.include_router(chat.router)
 app.include_router(ingest.router)
 app.include_router(export.router)
 app.include_router(sync.router)
+app.include_router(backups.router)
 app.include_router(documents.router)
 
 # >>> DEMO_START

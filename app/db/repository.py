@@ -21,9 +21,19 @@ from typing import Any, Sequence
 
 from psycopg.types.json import Jsonb
 
+from app.db.notebook_merge import merge_notebook_snapshots
+
 # A single push is capped so one bad client cannot send an unbounded statement.
 # The whole seeded library is a few hundred rows, so this is generous.
 MAX_ROWS_PER_ENTITY = 2_000
+
+# Critical prep docs: auto-backup when any of these kinds change.
+_BACKUP_TRIGGER_KINDS = frozenset(
+    {"notebook", "arguments", "guide_edits", "facts", "openings"}
+)
+_AUTO_BACKUP_MIN_INTERVAL_SECONDS = 60 * 60  # one auto snapshot per hour
+_AUTO_BACKUP_KEEP = 200  # ~8 days of hourly + headroom
+_MANUAL_BACKUP_KEEP = 100
 
 
 @dataclass(frozen=True)
@@ -287,8 +297,8 @@ def _push_values(
 
 
 # How many prior library_records payloads to keep per (workspace, kind, id).
-# Enough to recover a bad seed bump or mistaken restore without unbounded growth.
-_LIBRARY_REVISION_KEEP = 40
+# High enough for competition week (frequent sync) without Neon PITR.
+_LIBRARY_REVISION_KEEP = 120
 
 
 def _archive_library_record_before_overwrite(
@@ -411,9 +421,15 @@ def push_changes(
         """
 
         count = 0
+        touched_backup_kinds = False
         for row in rows[:MAX_ROWS_PER_ENTITY]:
             prepared = _with_push_defaults(spec, row)
             if name == "library_records":
+                if prepared.get("kind") in _BACKUP_TRIGGER_KINDS:
+                    touched_backup_kinds = True
+                prepared = _protect_notebook_from_smaller_push(
+                    cursor, workspace_id, prepared
+                )
                 _archive_library_record_before_overwrite(
                     cursor, workspace_id, prepared, now
                 )
@@ -423,8 +439,376 @@ def push_changes(
             )
             count += cursor.rowcount
         written[name] = count
+        if name == "library_records" and touched_backup_kinds and count:
+            maybe_auto_backup_workspace(cursor, workspace_id, now, reason="sync_push")
 
     return written
+
+
+def _protect_notebook_from_smaller_push(
+    cursor,
+    workspace_id: str,
+    prepared: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Merge an incoming notebook row with the server copy when the push would
+    drop sections that still have pages. Sync stays last-write-wins for timing;
+    content merge only fills gaps the wiped client no longer has.
+    """
+    if prepared.get("kind") != "notebook":
+        return prepared
+    incoming = prepared.get("data")
+    if not isinstance(incoming, dict):
+        return prepared
+
+    try:
+        cursor.execute(
+            """
+            SELECT data
+            FROM library_records
+            WHERE workspace_id = %s AND kind = 'notebook' AND id = %s
+              AND deleted_at IS NULL
+            """,
+            (workspace_id, prepared.get("id")),
+        )
+        existing = cursor.fetchone()
+        if not existing or not isinstance(existing.get("data"), dict):
+            return prepared
+        merged = merge_notebook_snapshots(incoming, existing["data"])
+        if merged != incoming:
+            return {**prepared, "data": merged}
+    except Exception:
+        return prepared
+    return prepared
+
+
+def collect_workspace_backup_payload(cursor, workspace_id: str) -> dict[str, Any]:
+    """
+    Build a downloadable / restorable snapshot of everything that must survive
+    a hard refresh or a bad sync (not PDF bytes — those live in Blob).
+    """
+    cursor.execute(
+        """
+        SELECT kind, id, data, updated_at
+        FROM library_records
+        WHERE workspace_id = %s AND deleted_at IS NULL
+        ORDER BY kind, id
+        """,
+        (workspace_id,),
+    )
+    library_records = [
+        {
+            "kind": row["kind"],
+            "id": row["id"],
+            "data": row["data"],
+            "updatedAt": to_epoch_ms(row["updated_at"]) if row["updated_at"] else None,
+        }
+        for row in cursor.fetchall()
+    ]
+
+    cursor.execute(
+        """
+        SELECT id, case_id, document_id, page, kind, quote, body, rects, pinned,
+               color, topics, updated_at
+        FROM annotations
+        WHERE workspace_id = %s AND deleted_at IS NULL
+        ORDER BY updated_at
+        """,
+        (workspace_id,),
+    )
+    annotations = [
+        {
+            "id": row["id"],
+            "caseId": row["case_id"],
+            "fileId": row["document_id"],
+            "page": row["page"],
+            "kind": row["kind"],
+            "quote": row["quote"],
+            "text": row["body"],
+            "rects": row["rects"],
+            "pinned": row["pinned"],
+            "color": row["color"],
+            "topics": row["topics"],
+            "updatedAt": to_epoch_ms(row["updated_at"]) if row["updated_at"] else None,
+        }
+        for row in cursor.fetchall()
+    ]
+
+    cursor.execute(
+        """
+        SELECT case_id, layer_id, html, updated_at
+        FROM notes
+        WHERE workspace_id = %s AND deleted_at IS NULL
+        ORDER BY case_id, layer_id
+        """,
+        (workspace_id,),
+    )
+    notes = [
+        {
+            "caseId": row["case_id"],
+            "layerId": row["layer_id"],
+            "html": row["html"],
+            "updatedAt": to_epoch_ms(row["updated_at"]) if row["updated_at"] else None,
+        }
+        for row in cursor.fetchall()
+    ]
+
+    cursor.execute(
+        """
+        SELECT id, name, cite, year, issue, tag, usefulness, holding, rule,
+               use_petitioner, use_respondent, suggested_file, updated_at
+        FROM cases
+        WHERE workspace_id = %s AND deleted_at IS NULL
+        ORDER BY id
+        """,
+        (workspace_id,),
+    )
+    cases = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "cite": row["cite"],
+            "year": row["year"],
+            "issue": row["issue"],
+            "tag": row["tag"],
+            "usefulness": row["usefulness"],
+            "holding": row["holding"],
+            "rule": row["rule"],
+            "usePetitioner": row["use_petitioner"],
+            "useRespondent": row["use_respondent"],
+            "suggestedFile": row["suggested_file"],
+            "updatedAt": to_epoch_ms(row["updated_at"]) if row["updated_at"] else None,
+        }
+        for row in cursor.fetchall()
+    ]
+
+    cursor.execute(
+        """
+        SELECT id, case_id, name, size_bytes, content_type, blob_pathname,
+               blob_url, updated_at
+        FROM documents
+        WHERE workspace_id = %s AND deleted_at IS NULL
+        ORDER BY id
+        """,
+        (workspace_id,),
+    )
+    documents = [
+        {
+            "id": row["id"],
+            "caseId": row["case_id"],
+            "name": row["name"],
+            "size": row["size_bytes"],
+            "contentType": row["content_type"],
+            "stored": row["blob_pathname"] is not None,
+            "blobUrl": row["blob_url"],
+            "updatedAt": to_epoch_ms(row["updated_at"]) if row["updated_at"] else None,
+        }
+        for row in cursor.fetchall()
+    ]
+
+    return {
+        "version": 1,
+        "workspaceId": workspace_id,
+        "library_records": library_records,
+        "annotations": annotations,
+        "notes": notes,
+        "cases": cases,
+        "documents": documents,
+    }
+
+
+def create_workspace_backup(
+    cursor,
+    workspace_id: str,
+    *,
+    label: str,
+    source: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Insert a full workspace snapshot and prune old auto/manual rows."""
+    stamp = now or datetime.now(timezone.utc)
+    payload = collect_workspace_backup_payload(cursor, workspace_id)
+    cursor.execute(
+        """
+        INSERT INTO workspace_backups (workspace_id, label, source, payload, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id, label, source, created_at
+        """,
+        (workspace_id, label[:200], source[:80], Jsonb(payload), stamp),
+    )
+    row = cursor.fetchone()
+    _prune_workspace_backups(cursor, workspace_id, source)
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "source": row["source"],
+        "createdAt": to_epoch_ms(row["created_at"]),
+    }
+
+
+def maybe_auto_backup_workspace(
+    cursor,
+    workspace_id: str,
+    now: datetime,
+    *,
+    reason: str = "sync_push",
+) -> dict[str, Any] | None:
+    """
+    Hourly automatic snapshot when prep docs changed. Never blocks sync if the
+    backups table is missing (migration not applied yet).
+    """
+    try:
+        cursor.execute(
+            """
+            SELECT created_at
+            FROM workspace_backups
+            WHERE workspace_id = %s AND source LIKE 'auto%%'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (workspace_id,),
+        )
+        latest = cursor.fetchone()
+        if latest and latest["created_at"]:
+            age = (now - latest["created_at"]).total_seconds()
+            if age < _AUTO_BACKUP_MIN_INTERVAL_SECONDS:
+                return None
+        label = f"Auto {now.strftime('%Y-%m-%d %H:%M')} UTC ({reason})"
+        return create_workspace_backup(
+            cursor,
+            workspace_id,
+            label=label,
+            source="auto_hourly",
+            now=now,
+        )
+    except Exception:
+        return None
+
+
+def _prune_workspace_backups(cursor, workspace_id: str, source: str) -> None:
+    keep = _AUTO_BACKUP_KEEP if source.startswith("auto") else _MANUAL_BACKUP_KEEP
+    pattern = "auto%" if source.startswith("auto") else "manual%"
+    cursor.execute(
+        """
+        DELETE FROM workspace_backups
+        WHERE id IN (
+            SELECT id FROM workspace_backups
+            WHERE workspace_id = %s AND source LIKE %s
+            ORDER BY created_at DESC
+            OFFSET %s
+        )
+        """,
+        (workspace_id, pattern, keep),
+    )
+
+
+def list_workspace_backups(cursor, workspace_id: str, *, limit: int = 50) -> list[dict]:
+    cursor.execute(
+        """
+        SELECT id, label, source, created_at,
+               pg_column_size(payload) AS bytes
+        FROM workspace_backups
+        WHERE workspace_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (workspace_id, min(limit, 200)),
+    )
+    return [
+        {
+            "id": row["id"],
+            "label": row["label"],
+            "source": row["source"],
+            "createdAt": to_epoch_ms(row["created_at"]),
+            "bytes": row["bytes"] or 0,
+        }
+        for row in cursor.fetchall()
+    ]
+
+
+def get_workspace_backup(cursor, workspace_id: str, backup_id: int) -> dict[str, Any] | None:
+    cursor.execute(
+        """
+        SELECT id, label, source, created_at, payload
+        FROM workspace_backups
+        WHERE workspace_id = %s AND id = %s
+        """,
+        (workspace_id, backup_id),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "source": row["source"],
+        "createdAt": to_epoch_ms(row["created_at"]),
+        "payload": row["payload"],
+    }
+
+
+def restore_workspace_backup(
+    cursor,
+    workspace_id: str,
+    backup_id: int,
+    now: datetime,
+) -> dict[str, Any]:
+    """
+    Replace live library_records (and related rows present in the snapshot)
+    from a backup. Archives the current workspace first as source=before_restore.
+    """
+    backup = get_workspace_backup(cursor, workspace_id, backup_id)
+    if not backup:
+        raise ValueError("backup_not_found")
+
+    create_workspace_backup(
+        cursor,
+        workspace_id,
+        label=f"Before restore of #{backup_id}",
+        source="before_restore",
+        now=now,
+    )
+
+    payload = backup["payload"] or {}
+    # Restore library_records with a bumped updated_at so clients pull them.
+    for record in payload.get("library_records") or []:
+        kind = record.get("kind")
+        record_id = record.get("id")
+        data = record.get("data")
+        if not isinstance(kind, str) or not isinstance(record_id, str):
+            continue
+        if kind in _BACKUP_TRIGGER_KINDS or kind in {
+            "opinions",
+            "case_facts",
+            "cites",
+            "timeline",
+            "note_tabs",
+            "article_titles",
+            "pdf_bookmarks",
+        }:
+            _archive_library_record_before_overwrite(
+                cursor,
+                workspace_id,
+                {"kind": kind, "id": record_id, "data": data},
+                now,
+            )
+            cursor.execute(
+                """
+                INSERT INTO library_records (workspace_id, kind, id, data, updated_at, deleted_at)
+                VALUES (%s, %s, %s, %s, %s, NULL)
+                ON CONFLICT (workspace_id, kind, id) DO UPDATE SET
+                    data = EXCLUDED.data,
+                    updated_at = EXCLUDED.updated_at,
+                    deleted_at = NULL
+                """,
+                (workspace_id, kind, record_id, Jsonb(data), now),
+            )
+
+    return {
+        "restoredBackupId": backup_id,
+        "label": backup["label"],
+        "libraryRecords": len(payload.get("library_records") or []),
+    }
 
 
 def document_to_wire(row: dict[str, Any]) -> dict[str, Any]:
