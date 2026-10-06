@@ -48,9 +48,24 @@ _BACKUP_TRIGGER_KINDS = frozenset(
 # Text fields on opinion / fact cards. A thinner push must not erase longer prose.
 _RICH_TEXT_KINDS = frozenset({"opinions", "case_facts"})
 _RICH_TEXT_FIELDS = ("bodyHtml", "notes", "summary", "text", "holding", "rule")
-_AUTO_BACKUP_MIN_INTERVAL_SECONDS = 60 * 60  # one auto snapshot per hour
-_AUTO_BACKUP_KEEP = 200  # ~8 days of hourly + headroom
+# Arguments / notebook change often before competition; snapshot every 15 minutes.
+_AUTO_BACKUP_MIN_INTERVAL_SECONDS = 15 * 60
+_AUTO_BACKUP_KEEP = 400  # ~4 days of 15-min snapshots + headroom
 _MANUAL_BACKUP_KEEP = 100
+
+# Explicit top-level keys in every downloadable backup (also still in library_records).
+_BACKUP_DOC_KINDS = (
+    "arguments",
+    "notebook",
+    "guide_edits",
+    "facts",
+    "openings",
+    "opinions",
+    "case_facts",
+    "cites",
+    "timeline",
+    "note_tabs",
+)
 
 # Category 3 ladder seed fingerprints (generated from the frontend seed file).
 # A sync push that re-uploads seed text must not erase manual argument notes.
@@ -768,6 +783,10 @@ def collect_workspace_backup_payload(cursor, workspace_id: str) -> dict[str, Any
     """
     Build a downloadable / restorable snapshot of everything that must survive
     a hard refresh or a bad sync (not PDF bytes — those live in Blob).
+
+    Arguments, notebook, guide, facts, openings, and the rest of library_records
+    are included twice: once in the full `library_records` array, and again as
+    named top-level keys so a JSON download is obviously complete.
     """
     cursor.execute(
         """
@@ -787,6 +806,9 @@ def collect_workspace_backup_payload(cursor, workspace_id: str) -> dict[str, Any
         }
         for row in cursor.fetchall()
     ]
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for record in library_records:
+        by_kind.setdefault(str(record["kind"]), []).append(record)
 
     cursor.execute(
         """
@@ -888,10 +910,26 @@ def collect_workspace_backup_payload(cursor, workspace_id: str) -> dict[str, Any
         for row in cursor.fetchall()
     ]
 
+    named_docs = {kind: by_kind.get(kind, []) for kind in _BACKUP_DOC_KINDS}
+    includes = [
+        kind for kind, rows in named_docs.items() if rows
+    ] + [
+        name
+        for name, rows in (
+            ("annotations", annotations),
+            ("notes", notes),
+            ("cases", cases),
+            ("documents", documents),
+        )
+        if rows
+    ]
+
     return {
-        "version": 1,
+        "version": 2,
         "workspaceId": workspace_id,
+        "includes": includes,
         "library_records": library_records,
+        **named_docs,
         "annotations": annotations,
         "notes": notes,
         "cases": cases,
@@ -920,11 +958,16 @@ def create_workspace_backup(
     )
     row = cursor.fetchone()
     _prune_workspace_backups(cursor, workspace_id, source)
+    includes = payload.get("includes") if isinstance(payload, dict) else []
     return {
         "id": row["id"],
         "label": row["label"],
         "source": row["source"],
         "createdAt": to_epoch_ms(row["created_at"]),
+        "includes": includes or [],
+        "hasArguments": bool(
+            isinstance(payload, dict) and payload.get("arguments")
+        ),
     }
 
 
@@ -1052,8 +1095,10 @@ def restore_workspace_backup(
     )
 
     payload = backup["payload"] or {}
+    records = _library_records_from_backup_payload(payload)
     # Restore library_records with a bumped updated_at so clients pull them.
-    for record in payload.get("library_records") or []:
+    restored = 0
+    for record in records:
         kind = record.get("kind")
         record_id = record.get("id")
         data = record.get("data")
@@ -1085,12 +1130,66 @@ def restore_workspace_backup(
                 """,
                 (workspace_id, kind, record_id, Jsonb(data), now),
             )
+            restored += 1
 
     return {
         "restoredBackupId": backup_id,
         "label": backup["label"],
-        "libraryRecords": len(payload.get("library_records") or []),
+        "libraryRecords": restored,
+        "hasArguments": any(r.get("kind") == "arguments" for r in records),
     }
+
+
+def _library_records_from_backup_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Normalize backup shapes into a list of {kind, id, data} rows.
+
+    Supports v2 named keys (arguments / notebook / …), the v1 library_records
+    array, and incomplete dict snapshots that only stored arguments.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(kind: str, record_id: str, data: Any) -> None:
+        key = (kind, record_id)
+        if key in seen:
+            return
+        seen.add(key)
+        records.append({"kind": kind, "id": record_id, "data": data})
+
+    raw = payload.get("library_records")
+    if isinstance(raw, list):
+        for record in raw:
+            if not isinstance(record, dict):
+                continue
+            kind = record.get("kind")
+            record_id = record.get("id")
+            if isinstance(kind, str) and isinstance(record_id, str):
+                add(kind, record_id, record.get("data"))
+    elif isinstance(raw, dict):
+        # Incomplete manual snapshots: {"arguments": board, ...}
+        for kind, data in raw.items():
+            if not isinstance(kind, str) or data is None:
+                continue
+            if isinstance(data, dict) and isinstance(data.get("id"), str) and "data" in data:
+                add(kind, data["id"], data.get("data"))
+            else:
+                add(kind, "main", data)
+
+    for kind in _BACKUP_DOC_KINDS:
+        rows = payload.get(kind)
+        if isinstance(rows, list):
+            for record in rows:
+                if isinstance(record, dict) and isinstance(record.get("id"), str):
+                    add(kind, record["id"], record.get("data"))
+        elif isinstance(rows, dict):
+            # Single board object saved under the kind key.
+            add(kind, str(rows.get("id") or "main"), rows)
+
+    return records
 
 
 def document_to_wire(row: dict[str, Any]) -> dict[str, Any]:
