@@ -586,6 +586,14 @@ def _pick_argument_notes(server_notes: str, incoming_notes: str, prong_id: str) 
         return server
     if server == incoming:
         return incoming
+    # Agent "claim in one sentence" restore must not beat manual prong notes.
+    if prong_id == "c3-s1-a":
+        server_ai = _looks_like_ai_prong_notes(server)
+        incoming_ai = _looks_like_ai_prong_notes(incoming)
+        if incoming_ai and not server_ai:
+            return server
+        if server_ai and not incoming_ai:
+            return incoming
     server_seed = _looks_like_seed_notes(prong_id, server)
     incoming_seed = _looks_like_seed_notes(prong_id, incoming)
     # Seed must never replace a divergent manual edit, even if seed is longer.
@@ -639,13 +647,21 @@ def _pick_rich_notes(server_notes: str, incoming_notes: str) -> str:
     return server if len(server) >= len(incoming) else incoming
 
 
-# Old bundled title that kept winning over the user's Jackson-method rewrite
-# because the seed fingerprint file was updated to match the good title.
-_BAD_C3_S1_A_TITLES = {
-    "a. Under Youngstown, President falls into lowest Category",
-    "a. Under Youngstown, President falls into lowest ebb",
+# Agent-written title/notes that must never beat the user's outline.
+# "Jackson's method / claim in one sentence" was restore fodder, not Tobi's typing.
+_AI_C3_S1_A_TITLES = {
+    "a. Jackson’s method, not just his labels",
+    "a. Jackson's method, not just his labels",
 }
-_GOOD_C3_S1_A_TITLE = "a. Jackson’s method, not just his labels"
+
+
+def _looks_like_ai_prong_notes(notes: str) -> bool:
+    norm = _norm_html(notes)
+    if not norm:
+        return False
+    if "The claim in one sentence" in norm and "Where Congress has legislated" in norm:
+        return True
+    return False
 
 
 def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) -> str:
@@ -658,15 +674,11 @@ def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) 
     if server == incoming:
         return incoming_title if isinstance(incoming_title, str) else incoming
 
-    # c3-s1-a: never let the old Youngstown seed title overwrite Jackson method.
+    # c3-s1-a: never let agent Jackson-method title overwrite the user's title.
     if prong_id == "c3-s1-a":
-        if incoming in _BAD_C3_S1_A_TITLES and (
-            server == _GOOD_C3_S1_A_TITLE or "Jackson" in server
-        ):
+        if incoming in _AI_C3_S1_A_TITLES and server not in _AI_C3_S1_A_TITLES:
             return server_title if isinstance(server_title, str) else server
-        if server in _BAD_C3_S1_A_TITLES and (
-            incoming == _GOOD_C3_S1_A_TITLE or "Jackson" in incoming
-        ):
+        if server in _AI_C3_S1_A_TITLES and incoming not in _AI_C3_S1_A_TITLES:
             return incoming_title if isinstance(incoming_title, str) else incoming
 
     seed_title = _seed_prong_title(prong_id)
@@ -674,12 +686,7 @@ def _pick_argument_title(server_title: str, incoming_title: str, prong_id: str) 
         if incoming == seed_title and server != seed_title:
             return server_title if isinstance(server_title, str) else server
         if server == seed_title and incoming != seed_title:
-            # Do not treat the current good Jackson title as disposable seed.
-            if prong_id == "c3-s1-a" and server == _GOOD_C3_S1_A_TITLE:
-                if incoming in _BAD_C3_S1_A_TITLES:
-                    return server_title if isinstance(server_title, str) else server
-            else:
-                return incoming_title if isinstance(incoming_title, str) else incoming
+            return incoming_title if isinstance(incoming_title, str) else incoming
     return (
         (server_title if isinstance(server_title, str) else server)
         if len(server) >= len(incoming)
@@ -825,13 +832,36 @@ def _protect_arguments_from_seed_or_thinner_push(
         server = existing["data"]
         server_title = _c3_s1_a_title(server)
         incoming_title = _c3_s1_a_title(incoming)
-        # Open tabs were stomping a manual Jackson-method restore every second
-        # with the older Youngstown seed title. Refuse that whole overwrite.
+        # Refuse whole-board overwrite when a tab pushes agent Jackson title
+        # over the user's Youngstown / manual outline title.
         if (
-            server_title == _GOOD_C3_S1_A_TITLE
-            and incoming_title in _BAD_C3_S1_A_TITLES
+            server_title not in _AI_C3_S1_A_TITLES
+            and incoming_title in _AI_C3_S1_A_TITLES
         ):
             return {**prepared, "data": server}
+
+        def _c3_notes(board: dict[str, Any]) -> str:
+            try:
+                for draft in (board.get("draftsBySide") or {}).get("petitioner") or []:
+                    if not isinstance(draft, dict):
+                        continue
+                    for section in draft.get("sections") or []:
+                        if not isinstance(section, dict):
+                            continue
+                        for prong in section.get("prongs") or []:
+                            if isinstance(prong, dict) and prong.get("id") == "c3-s1-a":
+                                return str(prong.get("notes") or "")
+            except Exception:
+                return ""
+            return ""
+
+        server_notes = _c3_notes(server)
+        incoming_notes = _c3_notes(incoming)
+        if _looks_like_ai_prong_notes(incoming_notes) and not _looks_like_ai_prong_notes(
+            server_notes
+        ):
+            return {**prepared, "data": server}
+
         merged = _merge_arguments_boards(incoming, server)
         if merged != incoming:
             return {**prepared, "data": merged}

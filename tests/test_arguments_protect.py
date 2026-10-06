@@ -37,7 +37,7 @@ def test_seed_notes_lose_to_manual_even_when_seed_is_longer():
     assert "Look at what Congress" in _pick_argument_notes(manual, seedish, "c3-s2-a")
 
 
-def test_merge_keeps_manual_jackson_over_seed_push():
+def test_merge_keeps_manual_jackson_test_over_seed_push():
     server = {
         "draftsBySide": {
             "petitioner": [
@@ -49,8 +49,8 @@ def test_merge_keeps_manual_jackson_over_seed_push():
                             "prongs": [
                                 {
                                     "id": "c3-s1-a",
-                                    "title": "a. Jackson’s method, not just his labels",
-                                    "notes": "<h2>The claim in one sentence</h2><p>Where Congress has legislated</p>",
+                                    "title": "a. Under Youngstown, President falls into lowest Category",
+                                    "notes": "<h2>Jackson's test</h2><p>Category 1 out: the government conceded</p>",
                                 }
                             ],
                         }
@@ -70,7 +70,7 @@ def test_merge_keeps_manual_jackson_over_seed_push():
                             "prongs": [
                                 {
                                     "id": "c3-s1-a",
-                                    "title": "a. Jackson’s method, not just his labels",
+                                    "title": "a. Under Youngstown, President falls into lowest Category",
                                     "notes": "<h2>Walk the three steps he walked</h2><ol><li><p>Category 1 out: the government</p></li></ol>",
                                 }
                             ],
@@ -82,7 +82,7 @@ def test_merge_keeps_manual_jackson_over_seed_push():
     }
     merged = _merge_arguments_boards(incoming, server)
     notes = merged["draftsBySide"]["petitioner"][0]["sections"][0]["prongs"][0]["notes"]
-    assert "The claim in one sentence" in notes
+    assert "Jackson's test" in notes
 
 
 def test_protect_arguments_uses_server_when_push_is_seed():
@@ -171,8 +171,8 @@ def test_merge_keeps_whole_argument_notes_when_seed_arrives():
                             "prongs": [
                                 {
                                     "id": "c3-s1-a",
-                                    "title": "a. Jackson’s method, not just his labels",
-                                    "notes": "<p>claim in one sentence</p>",
+                                    "title": "a. Under Youngstown, President falls into lowest Category",
+                                    "notes": "<h2>Jackson's test</h2><p>manual outline notes</p>",
                                 }
                             ],
                         }
@@ -211,4 +211,59 @@ def test_merge_keeps_whole_argument_notes_when_seed_arrives():
     assert "2nd Ebb" in draft["notes"]
     assert "Introduction" not in draft["notes"]
     prong = draft["sections"][0]["prongs"][0]
-    assert "Jackson" in prong["title"]
+    assert "Jackson's test" in prong["notes"]
+
+
+def test_merge_rejects_ai_jackson_title_and_claim_notes():
+    server = {
+        "draftsBySide": {
+            "petitioner": [
+                {
+                    "id": "alt-q2-ladder",
+                    "notes": MANUAL_DRAFT,
+                    "sections": [
+                        {
+                            "id": "c3-s1",
+                            "prongs": [
+                                {
+                                    "id": "c3-s1-a",
+                                    "title": "a. Under Youngstown, President falls into lowest Category",
+                                    "notes": "<h2>Jackson's test</h2><p>Category 1 out</p>",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    incoming = {
+        "draftsBySide": {
+            "petitioner": [
+                {
+                    "id": "alt-q2-ladder",
+                    "notes": MANUAL_DRAFT,
+                    "sections": [
+                        {
+                            "id": "c3-s1",
+                            "prongs": [
+                                {
+                                    "id": "c3-s1-a",
+                                    "title": "a. Jackson’s method, not just his labels",
+                                    "notes": (
+                                        "<h2>The claim in one sentence</h2>"
+                                        "<p>Where Congress has legislated in an area</p>"
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    merged = _merge_arguments_boards(incoming, server)
+    prong = merged["draftsBySide"]["petitioner"][0]["sections"][0]["prongs"][0]
+    assert "Youngstown" in prong["title"]
+    assert "Jackson's test" in prong["notes"]
+    assert "claim in one sentence" not in prong["notes"].lower()
