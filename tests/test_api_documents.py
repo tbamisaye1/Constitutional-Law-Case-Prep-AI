@@ -135,6 +135,25 @@ def test_download_redirects_rather_than_streaming(client, workspace_id, blob_stu
 
 
 @requires_database
+def test_url_endpoint_returns_the_blob_url_as_json(client, workspace_id, blob_stub):
+    """
+    Browsers cannot follow the /file redirect with a custom header attached,
+    so the web client asks for the URL and fetches it header-free.
+    """
+    client.post(
+        "/documents",
+        headers={WORKSPACE_HEADER: workspace_id},
+        files={"file": ("record.pdf", _pdf_bytes(), "application/pdf")},
+        data={"document_id": "pdf-1", "case_id": "case-at-bar"},
+    )
+
+    response = client.get("/documents/pdf-1/url", headers={WORKSPACE_HEADER: workspace_id})
+
+    assert response.status_code == 200
+    assert response.json()["url"].startswith("https://")
+
+
+@requires_database
 def test_another_workspace_cannot_read_the_document(client, workspace_id, blob_stub):
     import uuid
 

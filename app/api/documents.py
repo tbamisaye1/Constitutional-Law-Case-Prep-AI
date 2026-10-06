@@ -282,18 +282,9 @@ def read_document(
     return document_to_wire(row)
 
 
-@router.get("/{document_id}/file")
-def download_document(
-    document_id: str,
-    session: WorkspaceSession = Depends(workspace_session),
-) -> RedirectResponse:
+def _stored_blob_url(session: WorkspaceSession, document_id: str) -> str:
     """
-    Redirect to the PDF in Blob storage.
-
-    A redirect rather than a proxied stream, because a proxied response would
-    hit Vercel's 4.5 MB response cap and would bill function time for bytes the
-    CDN serves better. The trade-off is that the client follows a URL which is
-    unguessable but not access-controlled.
+    The Blob URL for one stored document in this workspace.
 
     Raises:
         HTTPException: 404 when the document is unknown, 409 when the row
@@ -312,6 +303,43 @@ def download_document(
                 "Re-add the PDF from the device that has it."
             ),
         )
+    return url
+
+
+@router.get("/{document_id}/url")
+def document_url(
+    document_id: str,
+    session: WorkspaceSession = Depends(workspace_session),
+) -> dict[str, str]:
+    """
+    Return the PDF's Blob URL as JSON instead of redirecting to it.
+
+    Browsers cannot follow the /file redirect: fetch() re-sends the custom
+    X-Workspace-Id header to the Blob CDN, which forces a CORS preflight that
+    Blob rejects ("TypeError: Failed to fetch"). The web client calls this,
+    then fetches the URL with no custom headers, which is a simple CORS GET.
+    """
+    return {"url": _stored_blob_url(session, document_id)}
+
+
+@router.get("/{document_id}/file")
+def download_document(
+    document_id: str,
+    session: WorkspaceSession = Depends(workspace_session),
+) -> RedirectResponse:
+    """
+    Redirect to the PDF in Blob storage.
+
+    A redirect rather than a proxied stream, because a proxied response would
+    hit Vercel's 4.5 MB response cap and would bill function time for bytes the
+    CDN serves better. The trade-off is that the client follows a URL which is
+    unguessable but not access-controlled.
+
+    Raises:
+        HTTPException: 404 when the document is unknown, 409 when the row
+            exists but its bytes were never uploaded.
+    """
+    url = _stored_blob_url(session, document_id)
     # 307 keeps the method and tells caches nothing is permanent here; the blob
     # pathname changes on every re-upload.
     return RedirectResponse(url=url, status_code=307)
