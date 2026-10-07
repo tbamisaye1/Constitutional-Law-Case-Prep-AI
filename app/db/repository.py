@@ -588,6 +588,7 @@ def push_changes(
                         )
                     rejected.append(entry)
                     continue
+                prepared = _preserve_arguments_scratch(prepared, existing)
                 prepared = _protect_notebook_from_smaller_push(
                     cursor, workspace_id, prepared, existing=existing
                 )
@@ -1169,6 +1170,55 @@ def _c3_s1_a_title(board: dict[str, Any]) -> str:
     except Exception:
         return ""
     return ""
+
+
+_SCRATCH_FIELDS = ("scratch", "pieceScratch")
+
+
+def _preserve_arguments_scratch(
+    prepared: dict[str, Any], existing: Any
+) -> dict[str, Any]:
+    """
+    Keep a draft's scratch notes when a push simply leaves the field out.
+
+    The web app always sends `scratch` (a string, '' when cleared) and
+    `pieceScratch` (an object) for drafts it knows about, so a draft that
+    arrives WITHOUT one of these keys came from a client that never had it
+    (an old tab, a stale cache). Without this, that push silently erased the
+    notes on the server. A deliberate clear still works: it sends the key.
+    """
+    if prepared.get("kind") != "arguments" or prepared.get("deleted"):
+        return prepared
+    incoming = prepared.get("data")
+    if existing is _NOT_LOADED or not existing or existing.get("deleted_at"):
+        return prepared
+    server = existing.get("data")
+    if not isinstance(incoming, dict) or not isinstance(server, dict):
+        return prepared
+    server_sides = server.get("draftsBySide") or {}
+    incoming_sides = incoming.get("draftsBySide") or {}
+    if not isinstance(server_sides, dict) or not isinstance(incoming_sides, dict):
+        return prepared
+    changed = False
+    next_sides: dict[str, Any] = dict(incoming_sides)
+    for side, drafts in incoming_sides.items():
+        server_drafts = server_sides.get(side)
+        if not isinstance(drafts, list) or not isinstance(server_drafts, list):
+            continue
+        by_id = {d.get("id"): d for d in server_drafts if isinstance(d, dict)}
+        new_list = []
+        for draft in drafts:
+            stored = by_id.get(draft.get("id")) if isinstance(draft, dict) else None
+            if isinstance(stored, dict):
+                for field in _SCRATCH_FIELDS:
+                    if field not in draft and stored.get(field):
+                        draft = {**draft, field: stored[field]}
+                        changed = True
+            new_list.append(draft)
+        next_sides[side] = new_list
+    if not changed:
+        return prepared
+    return {**prepared, "data": {**incoming, "draftsBySide": next_sides}}
 
 
 def _protect_arguments_stale_base(
