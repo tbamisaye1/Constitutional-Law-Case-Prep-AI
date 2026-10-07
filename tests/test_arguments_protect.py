@@ -395,3 +395,29 @@ def test_stale_base_identical_content_skips_check():
     assert reason is None
     assert server_row is None
     assert out is prepared
+
+
+def _scratch_row(draft):
+    return {"kind": "arguments", "id": "main", "data": {"draftsBySide": {"petitioner": [draft]}}}
+
+
+def test_push_without_scratch_key_keeps_server_scratch():
+    from app.db.repository import _preserve_arguments_scratch
+
+    existing = {
+        "data": {"draftsBySide": {"petitioner": [{"id": "d", "scratch": "<p>article</p>", "pieceScratch": {"p": "<p>x</p>"}}]}},
+        "deleted_at": None,
+    }
+    out = _preserve_arguments_scratch(_scratch_row({"id": "d", "notes": "n"}), existing)
+    draft = out["data"]["draftsBySide"]["petitioner"][0]
+    assert draft["scratch"] == "<p>article</p>"
+    assert draft["pieceScratch"] == {"p": "<p>x</p>"}
+    assert draft["notes"] == "n"
+
+
+def test_explicit_clear_of_scratch_is_respected():
+    from app.db.repository import _preserve_arguments_scratch
+
+    existing = {"data": {"draftsBySide": {"petitioner": [{"id": "d", "scratch": "<p>old</p>"}]}}, "deleted_at": None}
+    out = _preserve_arguments_scratch(_scratch_row({"id": "d", "scratch": ""}), existing)
+    assert out["data"]["draftsBySide"]["petitioner"][0]["scratch"] == ""
