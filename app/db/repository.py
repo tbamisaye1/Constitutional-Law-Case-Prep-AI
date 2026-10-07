@@ -341,11 +341,65 @@ def _push_values(
 # High enough for competition week (frequent sync) without Neon PITR.
 _LIBRARY_REVISION_KEEP = 120
 
+# Marks an `existing` argument the caller did not supply, as opposed to None,
+# which means the caller looked and the row does not exist.
+_NOT_LOADED: Any = object()
+
+
+def _load_library_record(
+    cursor,
+    workspace_id: str,
+    kind: Any,
+    record_id: Any,
+) -> dict[str, Any] | None:
+    """
+    The stored library_records row (data, updated_at, deleted_at), or None.
+
+    Neon bills for every byte a query returns, and Arguments / notebook rows
+    are the largest in the workspace. push_changes loads each row once with
+    this and hands it to every guard, instead of each guard selecting the
+    full board again. Tombstones are returned too; callers that only care
+    about live rows should pass the result through _live_record.
+    """
+    if not isinstance(kind, str) or not isinstance(record_id, str):
+        return None
+    cursor.execute(
+        """
+        SELECT data, updated_at, deleted_at
+        FROM library_records
+        WHERE workspace_id = %s AND kind = %s AND id = %s
+        """,
+        (workspace_id, kind, record_id),
+    )
+    return cursor.fetchone()
+
+
+def _live_record(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The row when it exists and is not a tombstone, otherwise None."""
+    if not existing or existing.get("deleted_at") is not None:
+        return None
+    return existing
+
+
+def _resolve_live_record(
+    cursor,
+    workspace_id: str,
+    kind: Any,
+    record_id: Any,
+    existing: Any,
+) -> dict[str, Any] | None:
+    """Use the caller's preloaded row when given, otherwise load it."""
+    if existing is _NOT_LOADED:
+        existing = _load_library_record(cursor, workspace_id, kind, record_id)
+    return _live_record(existing)
+
 
 def _library_record_payload_unchanged(
     cursor,
     workspace_id: str,
     prepared: dict[str, Any],
+    *,
+    existing: Any = _NOT_LOADED,
 ) -> bool:
     """
     True when the incoming library_records row would not change stored data.
@@ -361,20 +415,12 @@ def _library_record_payload_unchanged(
     if prepared.get("deleted"):
         return False
     try:
-        cursor.execute(
-            """
-            SELECT data, deleted_at
-            FROM library_records
-            WHERE workspace_id = %s AND kind = %s AND id = %s
-            """,
-            (workspace_id, kind, record_id),
-        )
-        existing = cursor.fetchone()
+        live = _resolve_live_record(cursor, workspace_id, kind, record_id, existing)
     except Exception:
         return False
-    if not existing or existing.get("deleted_at") is not None:
+    if not live:
         return False
-    return existing.get("data") == incoming
+    return live.get("data") == incoming
 
 
 def _archive_library_record_before_overwrite(
@@ -384,6 +430,7 @@ def _archive_library_record_before_overwrite(
     now: datetime,
     *,
     source: str = "sync_push",
+    existing: Any = _NOT_LOADED,
 ) -> int | None:
     """
     Copy the current library_records.data into history when a push would change it.
@@ -393,6 +440,8 @@ def _archive_library_record_before_overwrite(
 
     Args:
         source: Who triggered the overwrite (`sync_push`, `mcp`, `restore`, …).
+        existing: The stored row from _load_library_record, when the caller
+            already has it. Omit to load it here.
 
     Returns:
         The new revision id when a row was archived, otherwise None.
@@ -403,15 +452,7 @@ def _archive_library_record_before_overwrite(
         return None
 
     try:
-        cursor.execute(
-            """
-            SELECT data, updated_at
-            FROM library_records
-            WHERE workspace_id = %s AND kind = %s AND id = %s AND deleted_at IS NULL
-            """,
-            (workspace_id, kind, record_id),
-        )
-        existing = cursor.fetchone()
+        existing = _resolve_live_record(cursor, workspace_id, kind, record_id, existing)
         if not existing:
             return None
 
@@ -518,8 +559,18 @@ def push_changes(
             if name == "library_records":
                 if prepared.get("kind") in _BACKUP_TRIGGER_KINDS:
                     touched_backup_kinds = True
+                # The guards below only read the stored row and none of them
+                # writes it, so one load stays valid until the upsert.
+                try:
+                    existing = _load_library_record(
+                        cursor, workspace_id, prepared.get("kind"), prepared.get("id")
+                    )
+                except Exception:
+                    existing = _NOT_LOADED
                 prepared, reject_reason, reject_server_row = (
-                    _protect_arguments_stale_base(cursor, workspace_id, prepared)
+                    _protect_arguments_stale_base(
+                        cursor, workspace_id, prepared, existing=existing
+                    )
                 )
                 if reject_reason:
                     # Stale / missing base: keep the live row untouched. Writing
@@ -538,13 +589,13 @@ def push_changes(
                     rejected.append(entry)
                     continue
                 prepared = _protect_notebook_from_smaller_push(
-                    cursor, workspace_id, prepared
+                    cursor, workspace_id, prepared, existing=existing
                 )
                 prepared, reject_reason = _protect_arguments_from_seed_or_thinner_push(
-                    cursor, workspace_id, prepared
+                    cursor, workspace_id, prepared, existing=existing
                 )
                 prepared = _protect_rich_library_text_from_thinner_push(
-                    cursor, workspace_id, prepared
+                    cursor, workspace_id, prepared, existing=existing
                 )
                 if reject_reason:
                     # Stamp server time so the pull echoes the kept board and
@@ -558,13 +609,15 @@ def push_changes(
                             "reason": reject_reason,
                         }
                     )
-                elif _library_record_payload_unchanged(cursor, workspace_id, prepared):
+                elif _library_record_payload_unchanged(
+                    cursor, workspace_id, prepared, existing=existing
+                ):
                     # Identical content must not bump updated_at. Idle Arguments
                     # tabs were re-pushing the same board every few seconds and
                     # winning the version race against MCP / other devices.
                     continue
                 _archive_library_record_before_overwrite(
-                    cursor, workspace_id, prepared, now
+                    cursor, workspace_id, prepared, now, existing=existing
                 )
             cursor.execute(
                 statement,
@@ -664,22 +717,21 @@ def build_sync_audit_payload(
                         draft0 = ""
                     summary["draftNotesPrefix"] = draft0
                     # Compare to live server row so heartbeats that re-send the
-                    # same board are visible as arguments_unchanged=true.
+                    # same board are visible as arguments_unchanged=true. The
+                    # comparison runs in Postgres so only a boolean comes back,
+                    # not the whole board (Neon bills for returned bytes).
                     try:
                         cursor.execute(
                             """
-                            SELECT data
+                            SELECT jsonb_typeof(data) = 'object' AND data = %s AS same
                             FROM library_records
                             WHERE workspace_id = %s AND kind = 'arguments' AND id = %s
                               AND deleted_at IS NULL
                             """,
-                            (workspace_id, row.get("id") or "main"),
+                            (Jsonb(data), workspace_id, row.get("id") or "main"),
                         )
                         existing = cursor.fetchone()
-                        if existing and isinstance(existing.get("data"), dict):
-                            arguments_unchanged = existing["data"] == data
-                        else:
-                            arguments_unchanged = False
+                        arguments_unchanged = bool(existing and existing.get("same"))
                     except Exception:
                         arguments_unchanged = None
             else:
@@ -808,6 +860,8 @@ def _protect_notebook_from_smaller_push(
     cursor,
     workspace_id: str,
     prepared: dict[str, Any],
+    *,
+    existing: Any = _NOT_LOADED,
 ) -> dict[str, Any]:
     """
     Merge an incoming notebook row with the server copy when the push would
@@ -821,16 +875,9 @@ def _protect_notebook_from_smaller_push(
         return prepared
 
     try:
-        cursor.execute(
-            """
-            SELECT data
-            FROM library_records
-            WHERE workspace_id = %s AND kind = 'notebook' AND id = %s
-              AND deleted_at IS NULL
-            """,
-            (workspace_id, prepared.get("id")),
+        existing = _resolve_live_record(
+            cursor, workspace_id, "notebook", prepared.get("id"), existing
         )
-        existing = cursor.fetchone()
         if not existing or not isinstance(existing.get("data"), dict):
             return prepared
         merged = merge_notebook_snapshots(incoming, existing["data"])
@@ -1128,6 +1175,8 @@ def _protect_arguments_stale_base(
     cursor,
     workspace_id: str,
     prepared: dict[str, Any],
+    *,
+    existing: Any = _NOT_LOADED,
 ) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
     """
     Reject Arguments pushes that did not start from the live server version.
@@ -1147,16 +1196,9 @@ def _protect_arguments_stale_base(
     if not isinstance(incoming, dict):
         return prepared, None, None
     try:
-        cursor.execute(
-            """
-            SELECT data, updated_at
-            FROM library_records
-            WHERE workspace_id = %s AND kind = 'arguments' AND id = %s
-              AND deleted_at IS NULL
-            """,
-            (workspace_id, prepared.get("id")),
+        existing = _resolve_live_record(
+            cursor, workspace_id, "arguments", prepared.get("id"), existing
         )
-        existing = cursor.fetchone()
         if not existing or not isinstance(existing.get("data"), dict):
             return prepared, None, None
         server = existing["data"]
@@ -1182,6 +1224,8 @@ def _protect_arguments_from_seed_or_thinner_push(
     cursor,
     workspace_id: str,
     prepared: dict[str, Any],
+    *,
+    existing: Any = _NOT_LOADED,
 ) -> tuple[dict[str, Any], str | None]:
     """
     Block Category 3 seed / agent Jackson restores from erasing manual notes.
@@ -1196,16 +1240,9 @@ def _protect_arguments_from_seed_or_thinner_push(
     if not isinstance(incoming, dict):
         return prepared, None
     try:
-        cursor.execute(
-            """
-            SELECT data
-            FROM library_records
-            WHERE workspace_id = %s AND kind = 'arguments' AND id = %s
-              AND deleted_at IS NULL
-            """,
-            (workspace_id, prepared.get("id")),
+        existing = _resolve_live_record(
+            cursor, workspace_id, "arguments", prepared.get("id"), existing
         )
-        existing = cursor.fetchone()
         if not existing or not isinstance(existing.get("data"), dict):
             return prepared, None
         server = existing["data"]
@@ -1259,6 +1296,8 @@ def _protect_rich_library_text_from_thinner_push(
     cursor,
     workspace_id: str,
     prepared: dict[str, Any],
+    *,
+    existing: Any = _NOT_LOADED,
 ) -> dict[str, Any]:
     """
     Keep longer opinion / case-fact prose when a newer but thinner client push
@@ -1272,16 +1311,9 @@ def _protect_rich_library_text_from_thinner_push(
         return prepared
 
     try:
-        cursor.execute(
-            """
-            SELECT data
-            FROM library_records
-            WHERE workspace_id = %s AND kind = %s AND id = %s
-              AND deleted_at IS NULL
-            """,
-            (workspace_id, kind, prepared.get("id")),
+        existing = _resolve_live_record(
+            cursor, workspace_id, kind, prepared.get("id"), existing
         )
-        existing = cursor.fetchone()
         if not existing or not isinstance(existing.get("data"), dict):
             return prepared
         server = existing["data"]

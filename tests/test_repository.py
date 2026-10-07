@@ -322,3 +322,70 @@ def test_library_records_separate_kinds_sharing_an_id(cursor, workspace_id):
 
     assert len(records) == 2
     assert {row["kind"] for row in records} == {"cites", "timeline"}
+
+
+class _QueryRecorder:
+    """Wraps a real cursor and keeps every SQL string it executes."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.statements: list[str] = []
+
+    def execute(self, query, params=None):
+        self.statements.append(" ".join(str(query).split()))
+        return self._inner.execute(query, params)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _full_board_selects(statements: list[str]) -> list[str]:
+    return [
+        sql
+        for sql in statements
+        if sql.startswith("SELECT data") and "FROM library_records" in sql
+    ]
+
+
+@requires_database
+def test_arguments_push_reads_the_stored_board_once(cursor, workspace_id):
+    """
+    Neon bills for bytes returned, so the guards must share one load.
+
+    Every guard used to select the full Arguments board on its own, which
+    multiplied database egress on every heartbeat push.
+    """
+    from app.db.repository import to_epoch_ms
+
+    now = datetime.now(timezone.utc)
+    first = {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>first</p>"}]}}
+    _push(
+        cursor,
+        workspace_id,
+        {"library_records": [{"kind": "arguments", "id": "main", "data": first, "updatedAt": to_epoch_ms(now)}]},
+        now,
+    )
+    server_ms = to_epoch_ms(now)
+
+    recorder = _QueryRecorder(cursor)
+    later = now + timedelta(seconds=5)
+    edited = {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>second</p>"}]}}
+    written = _push(
+        recorder,
+        workspace_id,
+        {
+            "library_records": [
+                {
+                    "kind": "arguments",
+                    "id": "main",
+                    "data": edited,
+                    "updatedAt": to_epoch_ms(later),
+                    "baseUpdatedAt": server_ms,
+                }
+            ]
+        },
+        later,
+    )
+
+    assert written["library_records"] == 1
+    assert len(_full_board_selects(recorder.statements)) == 1
