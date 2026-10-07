@@ -351,9 +351,17 @@ def _load_library_record(
     workspace_id: str,
     kind: Any,
     record_id: Any,
+    *,
+    lock: bool = False,
 ) -> dict[str, Any] | None:
     """
     The stored library_records row (data, updated_at, deleted_at), or None.
+
+    lock=True selects the row FOR UPDATE. push_changes needs that: its guards
+    compare the push's baseUpdatedAt with this row, then upsert. Without the
+    lock an MCP write (which does lock) could commit between the check and the
+    upsert, and the push, checked against the old version, overwrote it. A
+    prong restored through MCP vanished 235 ms later exactly this way.
 
     Neon bills for every byte a query returns, and Arguments / notebook rows
     are the largest in the workspace. push_changes loads each row once with
@@ -368,7 +376,8 @@ def _load_library_record(
         SELECT data, updated_at, deleted_at
         FROM library_records
         WHERE workspace_id = %s AND kind = %s AND id = %s
-        """,
+        """
+        + ("FOR UPDATE" if lock else ""),
         (workspace_id, kind, record_id),
     )
     return cursor.fetchone()
@@ -562,8 +571,14 @@ def push_changes(
                 # The guards below only read the stored row and none of them
                 # writes it, so one load stays valid until the upsert.
                 try:
+                    # Locked until this push commits: the base check below and
+                    # the upsert must see the same version of the row.
                     existing = _load_library_record(
-                        cursor, workspace_id, prepared.get("kind"), prepared.get("id")
+                        cursor,
+                        workspace_id,
+                        prepared.get("kind"),
+                        prepared.get("id"),
+                        lock=True,
                     )
                 except Exception:
                     existing = _NOT_LOADED
