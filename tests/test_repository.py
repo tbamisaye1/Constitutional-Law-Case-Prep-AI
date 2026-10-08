@@ -31,7 +31,7 @@ def _push(cursor, workspace_id: str, changes: dict, now: datetime | None = None)
     from app.db.repository import push_changes, touch_workspace
 
     touch_workspace(cursor, workspace_id)
-    written, _rejected = push_changes(
+    written, _rejected, _accepted = push_changes(
         cursor, workspace_id, changes, now or datetime.now(timezone.utc)
     )
     return written

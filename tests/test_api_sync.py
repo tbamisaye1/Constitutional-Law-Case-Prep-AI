@@ -231,3 +231,47 @@ def test_identical_arguments_push_does_not_bump_updated_at(client, workspace_id)
         if row["kind"] == "arguments" and row["id"] == "main"
     )
     assert live["updatedAt"] == first_updated
+
+
+@requires_database
+def test_accepted_arguments_version_is_the_next_valid_base(client, workspace_id):
+    """
+    A tab that keeps typing while a push is in flight needs the stored version.
+
+    Its edit is stamped before the response's serverTime, so the next pull with
+    since=serverTime never echoes the row back. Without `accepted` the tab
+    pushed again with its old base and the stale-base guard refused it.
+    """
+
+    def board(notes: str) -> dict:
+        return {
+            "id": "main",
+            "draftsBySide": {
+                "petitioner": [{"id": "petitioner-main", "notes": notes, "sections": []}],
+                "respondent": [],
+            },
+        }
+
+    def push(since: int, notes: str, updated_at: int, base: int | None) -> dict:
+        row = {"kind": "arguments", "id": "main", "data": board(notes), "updatedAt": updated_at}
+        if base is not None:
+            row["baseUpdatedAt"] = base
+        return client.post(
+            "/sync",
+            headers={WORKSPACE_HEADER: workspace_id},
+            json={"since": since, "changes": {"library_records": [row]}},
+        ).json()
+
+    first = push(0, "<p>start</p>", 1_000, None)
+    [first_accepted] = first["accepted"]
+    assert first_accepted["kind"] == "arguments"
+    assert first_accepted["updatedAt"] == 1_000
+
+    second = push(first["serverTime"], "<p>start, then more</p>", 2_000, first_accepted["updatedAt"])
+    assert second["rejected"] == []
+    [second_accepted] = second["accepted"]
+    assert second_accepted["updatedAt"] == 2_000
+
+    third = push(second["serverTime"], "<p>start, then more, then more</p>", 3_000, 2_000)
+    assert third["rejected"] == []
+    assert third["written"]["library_records"] == 1

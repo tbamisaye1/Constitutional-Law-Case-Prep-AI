@@ -58,6 +58,9 @@ class SyncResponse(BaseModel):
     # Rows the server refused or rewrote (e.g. seed Arguments). Empty on a
     # normal successful push so older clients that ignore unknown fields stay fine.
     rejected: list[dict[str, Any]] = Field(default_factory=list)
+    # Arguments rows this push stored, with the exact updatedAt they now carry.
+    # The client uses it as the next baseUpdatedAt. See push_changes.
+    accepted: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -132,7 +135,7 @@ def push_then_pull(
         event="push_then_pull",
     )
 
-    written, rejected = push_changes(
+    written, rejected, accepted = push_changes(
         session.cursor, session.workspace_id, body.changes, now
     )
     changes = pull_changes(session.cursor, session.workspace_id, body.since)
@@ -158,6 +161,7 @@ def push_then_pull(
         changes=changes,
         written=written,
         rejected=rejected,
+        accepted=accepted,
     )
 
 
