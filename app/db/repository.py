@@ -1278,10 +1278,16 @@ def _protect_arguments_stale_base(
     server updated_at they last loaded; differing content without that match
     is refused and the live row is left alone.
 
+    A row with forceOverwrite=True skips this check. The client sets it only
+    from the Force save button, when the user has said this tab's board must
+    replace the server's. The replaced board is still archived to history.
+
     Returns (prepared, reason, server_row_or_none). server_row carries data +
     serverUpdatedAt so the client can drop its dirty board without a write.
     """
     if prepared.get("kind") != "arguments" or prepared.get("deleted"):
+        return prepared, None, None
+    if prepared.get("forceOverwrite") is True:
         return prepared, None, None
     incoming = prepared.get("data")
     if not isinstance(incoming, dict):

@@ -379,6 +379,48 @@ def test_stale_base_allows_push_when_base_matches():
     assert out["data"]["draftsBySide"]["petitioner"][0]["notes"] == "<p>real edit</p>"
 
 
+def test_force_overwrite_skips_stale_base_check():
+    server_at = datetime(2026, 10, 6, 18, 46, 56, tzinfo=timezone.utc)
+    existing = {
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>server</p>"}]}},
+        "updated_at": server_at,
+    }
+    prepared = {
+        "kind": "arguments",
+        "id": "main",
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>this tab</p>"}]}},
+        "updatedAt": to_epoch_ms(server_at) + 5000,
+        "baseUpdatedAt": 1,
+        "forceOverwrite": True,
+    }
+    out, reason, server_row = _protect_arguments_stale_base(
+        _Cursor(existing), "ws", prepared
+    )
+    assert reason is None
+    assert server_row is None
+    assert out is prepared
+
+
+def test_force_overwrite_must_be_literal_true():
+    server_at = datetime(2026, 10, 6, 18, 46, 56, tzinfo=timezone.utc)
+    existing = {
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>server</p>"}]}},
+        "updated_at": server_at,
+    }
+    prepared = {
+        "kind": "arguments",
+        "id": "main",
+        "data": {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>this tab</p>"}]}},
+        "updatedAt": to_epoch_ms(server_at) + 5000,
+        "baseUpdatedAt": 1,
+        "forceOverwrite": "yes",
+    }
+    _out, reason, _server_row = _protect_arguments_stale_base(
+        _Cursor(existing), "ws", prepared
+    )
+    assert reason == "arguments_rejected_stale_base"
+
+
 def test_stale_base_identical_content_skips_check():
     server_at = datetime(2026, 10, 6, 18, 46, 56, tzinfo=timezone.utc)
     board = {"draftsBySide": {"petitioner": [{"id": "d1", "notes": "<p>same</p>"}]}}
