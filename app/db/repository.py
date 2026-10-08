@@ -324,17 +324,23 @@ def _push_values(
             value = Jsonb(value)
         values.append(value)
 
-    # Clamp to server time. A client whose clock runs fast would otherwise write
-    # an updated_at in the future and win every later conflict, including
-    # against edits the user makes afterwards on another device.
-    client_updated_at = row.get("updatedAt")
-    updated_at = now
-    if isinstance(client_updated_at, (int, float)):
-        updated_at = min(from_epoch_ms(int(client_updated_at)), now)
-
-    values.append(updated_at)
+    values.append(_clamped_updated_at(row, now))
     values.append(now if row.get("deleted") else None)
     return tuple(values)
+
+
+def _clamped_updated_at(row: dict[str, Any], now: datetime) -> datetime:
+    """
+    The updated_at a pushed row is stored with.
+
+    Clamped to server time. A client whose clock runs fast would otherwise write
+    an updated_at in the future and win every later conflict, including against
+    edits the user makes afterwards on another device.
+    """
+    client_updated_at = row.get("updatedAt")
+    if isinstance(client_updated_at, (int, float)):
+        return min(from_epoch_ms(int(client_updated_at)), now)
+    return now
 
 
 # How many prior library_records payloads to keep per (workspace, kind, id).
@@ -506,7 +512,7 @@ def push_changes(
     workspace_id: str,
     payload: dict[str, Sequence[dict]],
     now: datetime,
-) -> tuple[dict[str, int], list[dict[str, Any]]]:
+) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Upsert client rows, keeping whichever version has the newer updatedAt.
 
@@ -519,12 +525,19 @@ def push_changes(
         now: Server time used to clamp client clocks and stamp tombstones.
 
     Returns:
-        (written, rejected). written maps collection name to rows actually
-        written. rejected lists Arguments (and similar) rows where protect
-        refused or rewrote the client's payload so the UI can warn.
+        (written, rejected, accepted). written maps collection name to rows
+        actually written. rejected lists Arguments (and similar) rows where
+        protect refused or rewrote the client's payload so the UI can warn.
+        accepted lists every Arguments row this push stored, as
+        {kind, id, updatedAt}. A tab that kept typing while the request was in
+        flight still has the row dirty, and it must send exactly this
+        updatedAt as its next baseUpdatedAt or the stale-base guard refuses it.
+        The normal pull cannot tell it, because an edit stamped before the
+        client's `since` cursor never comes back in `changes`.
     """
     written: dict[str, int] = {}
     rejected: list[dict[str, Any]] = []
+    accepted: list[dict[str, Any]] = []
 
     for name, rows in payload.items():
         spec = ENTITY_BY_NAME.get(name)
@@ -624,11 +637,24 @@ def push_changes(
                 _push_values(spec, workspace_id, prepared, now),
             )
             count += cursor.rowcount
+            if (
+                name == "library_records"
+                and prepared.get("kind") == "arguments"
+                and cursor.rowcount
+            ):
+                accepted.append(
+                    {
+                        "collection": name,
+                        "kind": "arguments",
+                        "id": prepared.get("id"),
+                        "updatedAt": to_epoch_ms(_clamped_updated_at(prepared, now)),
+                    }
+                )
         written[name] = count
         if name == "library_records" and touched_backup_kinds and count:
             maybe_auto_backup_workspace(cursor, workspace_id, now, reason="sync_push")
 
-    return written, rejected
+    return written, rejected, accepted
 
 
 _SYNC_AUDIT_KEEP = 500
