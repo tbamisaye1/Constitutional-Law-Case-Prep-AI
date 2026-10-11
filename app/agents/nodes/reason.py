@@ -85,7 +85,12 @@ def _reason_documents(state: PrepState) -> dict:
 
     question = _latest_user_text(state)
     history = list(state.get("chat_history") or [])
-    payload = build_reason_user_payload(question, _format_evidence(evidence), history)
+    payload = build_reason_user_payload(
+        question,
+        _format_evidence(evidence),
+        history,
+        side=state.get("advocacy_side"),
+    )
     model_id = resolve_chat_model_id(tier)
     model = get_chat_model(tier)
     try:

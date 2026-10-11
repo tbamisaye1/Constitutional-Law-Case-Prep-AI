@@ -5,6 +5,44 @@ Keep prompts here (not buried in the reason node) so you can tune wording
 without rewriting graph code. Interview tip: this is policy-as-code.
 """
 
+from __future__ import annotations
+
+from typing import Literal
+
+AdvocacySide = Literal["both", "petitioner", "respondent"]
+
+
+def normalize_advocacy_side(side: str | None) -> AdvocacySide:
+    raw = (side or "").strip().lower()
+    if raw in ("petitioner", "respondent"):
+        return raw  # type: ignore[return-value]
+    return "both"
+
+
+def advocacy_side_instruction(side: str | None) -> str:
+    """Lock Ask AI onto one advocacy side when the UI / query sets it."""
+    normalized = normalize_advocacy_side(side)
+    if normalized == "petitioner":
+        return (
+            "ADVOCACY SIDE (hard rule for this turn):\n"
+            "The user is preparing PETITIONER (Bobby Bronner). Evaluate, fill, "
+            "strengthen, and cite only for petitioner. Prefer petitioner argument "
+            "notes / outline chunks in the evidence. You may mention respondent "
+            "points only as the opposition the petitioner must answer — do not "
+            "switch into writing respondent's case."
+        )
+    if normalized == "respondent":
+        return (
+            "ADVOCACY SIDE (hard rule for this turn):\n"
+            "The user is preparing RESPONDENT (United States). Evaluate, fill, "
+            "strengthen, and cite only for respondent / the government. Prefer "
+            "respondent argument notes / outline chunks in the evidence. You may "
+            "mention petitioner points only as attacks to rebut — do not switch "
+            "into writing petitioner's case or lead with petitioner strengths."
+        )
+    return ""
+
+
 # Shared framing for every Ask AI mode. Without this, the model treats the
 # problem packet like a pile of real statutes and misses questions such as
 # "is the ATA just the fictional AUMF?"
@@ -78,6 +116,9 @@ Hard rules:
    case — not every question is petitioner vs respondent advocacy. Lead with a
    direct answer. Keep [ev-N] cites, but do not bury the answer under a
    brief-style wall of statute paraphrase.
+10. If an ADVOCACY SIDE block is present (petitioner or respondent), obey it for
+   the whole answer. Stay on that side; do not flip into writing the other
+   party's affirmative case.
 
 Output format (plain text):
 - Start with STATUS: grounded | partial | abstained
@@ -114,6 +155,9 @@ Hard rules:
 7. Keep answers short and plain. Lead with a direct answer to the question
    asked. The user may be reading to understand an article, not drafting a
    petitioner/respondent argument.
+8. If an ADVOCACY SIDE block is present (petitioner or respondent), obey it for
+   the whole answer. Stay on that side; do not flip into writing the other
+   party's affirmative case.
 
 Output format (plain text):
 - Start with STATUS: grounded | partial | abstained
@@ -126,12 +170,17 @@ def build_reason_user_payload(
     question: str,
     evidence_block: str,
     history: list[dict] | None = None,
+    *,
+    side: str | None = None,
 ) -> str:
     """Pack question + evidence (+ optional prior turns) for the reason model."""
     parts = [
         "EVIDENCE (you may only rely on this, plus any SELECTED PASSAGE in the question):",
         evidence_block,
     ]
+    side_block = advocacy_side_instruction(side)
+    if side_block:
+        parts.extend(["", side_block])
     hist_block = format_chat_history(history)
     if hist_block:
         parts.extend(

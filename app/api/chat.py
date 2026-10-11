@@ -62,6 +62,9 @@ class ChatRequest(BaseModel):
     history: list[ChatTurn] | None = None
     # Opt-in notebook evidence from this browser's localStorage notebook.
     notes: list[NotebookNoteIn] | None = None
+    # Advocacy lens from the Ask AI side toggle / Arguments tab.
+    # both | petitioner | respondent (default both = no side lock).
+    side: str | None = None
 
 
 class EvidenceOut(BaseModel):
@@ -116,7 +119,7 @@ def chat(body: ChatRequest):
         f"[chat] source={source} tier={tier} matter={body.matter_id} "
         f"q_len={len(body.message)} sel_len={len(sel)} "
         f"file={src!r} page={body.page!r} hist={len(history)} "
-        f"notes={len(client_notes)} "
+        f"notes={len(client_notes)} side={(body.side or 'both')!r} "
         f"q_preview={body.message[:120]!r} "
         f"sel_preview={sel[:160]!r}"
     )
@@ -130,6 +133,7 @@ def chat(body: ChatRequest):
         page=body.page,
         history=history,
         notes=client_notes,
+        side=body.side,
     )
 
     return ChatResponse(

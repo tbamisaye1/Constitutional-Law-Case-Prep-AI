@@ -63,13 +63,19 @@ def build_chat_message(
     *,
     source_file: str | None = None,
     page: int | None = None,
+    side: str | None = None,
 ) -> str:
     """Compose the HumanMessage content the agent graph sees."""
+    from app.grounding.prompts import advocacy_side_instruction
+
     q = expand_instant_case_aliases((question or "").strip())
+    side_block = advocacy_side_instruction(side)
     sel = (selection or "").strip()
     source = (source_file or "").strip()
     if not sel:
-        return q
+        if side_block and q:
+            return f"{side_block}\n\nUSER QUESTION:\n{q}"
+        return side_block or q
 
     parts: list[str] = [
         "SELECTED PASSAGE (explain this; do not ignore it):",
@@ -84,6 +90,8 @@ def build_chat_message(
             "Prefer this uploaded article for context. The user may be reading "
             "to understand the article, not arguing petitioner/respondent."
         )
+    if side_block:
+        parts.append(side_block)
     parts.append(f"USER QUESTION:\n{q}")
     return "\n\n".join(parts)
 

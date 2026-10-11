@@ -12,6 +12,7 @@ from typing import Any, Literal
 from langchain_core.messages import HumanMessage
 
 from app.agents.prep_graph import prep_graph
+from app.grounding.prompts import normalize_advocacy_side
 from app.grounding.selection import build_chat_message
 from app.llm.openrouter import normalize_model_tier
 
@@ -30,6 +31,7 @@ def run_prep_chat(
     page: int | None = None,
     history: list[dict[str, str]] | None = None,
     notes: list[dict[str, Any]] | None = None,
+    side: str | None = None,
 ) -> dict[str, Any]:
     """
     Run retrieve → reason → verify and return a plain dict for either transport.
@@ -40,11 +42,13 @@ def run_prep_chat(
     """
     source: GroundingSource = grounding_source or "documents"
     tier = normalize_model_tier(model_tier)
+    advocacy_side = normalize_advocacy_side(side)
     packed = build_chat_message(
         message,
         selection,
         source_file=source_file,
         page=page,
+        side=advocacy_side,
     )
     history_rows = [
         {"role": turn["role"], "content": turn["content"].strip()}
@@ -75,6 +79,7 @@ def run_prep_chat(
             "model_tier": tier,
             "chat_history": history_rows,
             "client_notes": client_notes,
+            "advocacy_side": advocacy_side,
             "evidence": [],
         }
     )

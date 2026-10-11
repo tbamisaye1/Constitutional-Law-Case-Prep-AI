@@ -36,3 +36,5 @@ class PrepState(TypedDict):
     # Optional notebook chunks the browser searched locally and sent with /chat.
     # Never persisted server-side beyond this request.
     client_notes: NotRequired[list[dict]]
+    # Ask AI side toggle / Arguments tab: both | petitioner | respondent.
+    advocacy_side: NotRequired[Literal["both", "petitioner", "respondent"]]
