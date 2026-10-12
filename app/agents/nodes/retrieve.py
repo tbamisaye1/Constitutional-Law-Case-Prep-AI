@@ -79,6 +79,69 @@ def _append_hit(
 _LOCAL_NOTE_TYPES = frozenset({"notebook", "annotation", "user_note"})
 
 
+def _is_oyez_summary(source: str) -> bool:
+    return str(source or "").strip().lower().endswith("(oyez summary)")
+
+
+def _oyez_base_name(source: str) -> str:
+    import re
+
+    return re.sub(r"\s*\(oyez summary\)\s*$", "", str(source or ""), flags=re.I).strip()
+
+
+def _distinctive_tokens(text: str) -> set[str]:
+    import re
+
+    stop = {
+        "united",
+        "states",
+        "v",
+        "vs",
+        "the",
+        "of",
+        "and",
+        "court",
+        "us",
+        "u",
+        "et",
+        "al",
+        "ex",
+        "parte",
+        "company",
+        "co",
+        "inc",
+    }
+    return {
+        t
+        for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(t) >= 4 and t not in stop
+    }
+
+
+def _prefer_uploads_over_oyez(hits: list[EvidenceHit]) -> list[EvidenceHit]:
+    """Drop bootstrap Oyez rows when a real PDF upload for that case is present."""
+    uploads = [h for h in hits if not _is_oyez_summary(str(h.get("source") or ""))]
+    if not uploads:
+        return hits
+    upload_tokens: set[str] = set()
+    for hit in uploads:
+        upload_tokens |= _distinctive_tokens(str(hit.get("source") or ""))
+    if not upload_tokens:
+        return hits
+    kept: list[EvidenceHit] = []
+    for hit in hits:
+        source = str(hit.get("source") or "")
+        if not _is_oyez_summary(source):
+            kept.append(hit)
+            continue
+        oyez_tokens = _distinctive_tokens(_oyez_base_name(source))
+        # e.g. "milligan" overlaps upload "Ex parte Milligan, 71 U.S....pdf"
+        if oyez_tokens & upload_tokens:
+            continue
+        kept.append(hit)
+    return kept
+
+
 def _merge_client_notes(evidence: list[EvidenceHit], client_notes: list[dict] | None) -> int:
     """Append browser-searched notebook pages / PDF annotations. Returns how many were added."""
     added = 0
@@ -220,6 +283,9 @@ def retrieve_node(state: PrepState) -> dict:
     # Keep Instant Case / record passages when present.
     record = [e for e in corpus if e.get("source_type") == "record"]
     other = [e for e in corpus if e.get("source_type") != "record"]
+    # If a real PDF upload for Milligan/Youngstown/etc. is in the hit list,
+    # drop the seeded "(Oyez summary)" twin so Ask AI cites the opinion.
+    other = _prefer_uploads_over_oyez(other)
     keep_local = local[:3]
     # Instant Case hard questions need record room; do not let Youngstown crowd them out.
     if instant_hits:
