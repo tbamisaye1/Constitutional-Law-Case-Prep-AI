@@ -16,10 +16,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import WorkspaceSession, workspace_session
+from app.auth.session import changes_include_writes, require_editor
 from app.db.repository import (
     ENTITY_BY_NAME,
     MAX_ROWS_PER_ENTITY,
@@ -45,10 +46,16 @@ class SyncPushRequest(BaseModel):
         changes: Collection name to rows in the client's own shape. Collections
             this backend does not know are ignored rather than rejected, so a
             newer frontend can deploy before the API catches up.
+        clientHint: Optional Chrome-side forensic crumbs (pending keys, ahead
+            flag, orphan drops). Folded into sync_audit_log.note so the next
+            freeze is diagnosable without the browser.
     """
 
     since: int = Field(default=0, ge=0)
     changes: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    client_hint: dict[str, Any] | None = Field(default=None, alias="clientHint")
+
+    model_config = {"populate_by_name": True}
 
 
 class SyncResponse(BaseModel):
@@ -107,6 +114,7 @@ def pull(
 @router.post("", response_model=SyncResponse, response_model_by_alias=True)
 def push_then_pull(
     body: SyncPushRequest,
+    request: Request,
     session: WorkspaceSession = Depends(workspace_session),
 ) -> SyncResponse:
     """
@@ -118,7 +126,12 @@ def push_then_pull(
 
     Every round-trip is also written to sync_audit_log (including empty
     heartbeats) so a wall of 200 OK cannot hide a frozen Arguments board again.
+
+    Empty heartbeats (pull-only POST) stay open. A POST that carries rows needs
+    the editor cookie when EDITOR_PASSWORD is configured.
     """
+    if changes_include_writes(body.changes):
+        require_editor(request)
     _reject_oversized(body.changes)
 
     unknown = sorted(set(body.changes) - set(ENTITY_BY_NAME))
@@ -153,6 +166,22 @@ def push_then_pull(
     if rejected:
         bits = [p for p in (audit.get("note") or "").split(",") if p]
         bits.append("rejected=" + ",".join(r.get("reason") or "?" for r in rejected))
+        audit["note"] = ",".join(dict.fromkeys(bits))
+    # Chrome-only crumbs (orphan dirty, local-ahead) that heartbeats hide.
+    hint = body.client_hint if isinstance(body.client_hint, dict) else None
+    if hint:
+        bits = [p for p in (audit.get("note") or "").split(",") if p]
+        pending_keys = hint.get("pendingKeys")
+        if isinstance(pending_keys, list) and pending_keys:
+            bits.append("client_pending=" + ",".join(str(k) for k in pending_keys[:12]))
+        if hint.get("argumentsLocalAhead"):
+            bits.append("client_args_ahead")
+        if hint.get("orphansDropped"):
+            bits.append(f"client_orphans_dropped={hint.get('orphansDropped')}")
+        if hint.get("canEdit") is False:
+            bits.append("client_view_only")
+        if hint.get("reason"):
+            bits.append(f"client_reason={hint.get('reason')}")
         audit["note"] = ",".join(dict.fromkeys(bits))
     record_sync_audit(session.cursor, session.workspace_id, audit, now)
 
